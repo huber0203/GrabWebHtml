@@ -1,0 +1,46 @@
+# Google Cloud Build 配置文件
+steps:
+  # 構建 Docker 映像
+  - name: 'gcr.io/cloud-builders/docker'
+    args: [
+      'build',
+      '-t', 'gcr.io/$PROJECT_ID/html-fetcher:$COMMIT_SHA',
+      '-t', 'gcr.io/$PROJECT_ID/html-fetcher:latest',
+      '.'
+    ]
+
+  # 推送映像到 Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/html-fetcher:$COMMIT_SHA']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/html-fetcher:latest']
+
+  # 部署到 Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args: [
+      'run', 'deploy', 'html-fetcher',
+      '--image', 'gcr.io/$PROJECT_ID/html-fetcher:$COMMIT_SHA',
+      '--region', 'asia-east1',
+      '--platform', 'managed',
+      '--allow-unauthenticated',
+      '--memory', '2Gi',
+      '--cpu', '2',
+      '--timeout', '300',
+      '--concurrency', '10',
+      '--max-instances', '10'
+    ]
+
+# 映像將被推送到 Container Registry
+images:
+  - 'gcr.io/$PROJECT_ID/html-fetcher:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/html-fetcher:latest'
+
+# 構建選項
+options:
+  machineType: 'E2_HIGHCPU_8'
+  diskSizeGb: '100'
+
+# 超時設定（20分鐘）
+timeout: '1200s'
