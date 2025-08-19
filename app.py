@@ -57,13 +57,14 @@ def default_filename(url: str, fallback_ext: str = "html") -> str:
 def clean_html_content(html_content: str) -> str:
     """
     清理 HTML 內容，移除雜訊，保留重要的表格和文字資訊
+    特別針對 goodinfo.tw 股票數據進行優化
     """
     soup = BeautifulSoup(html_content, 'html.parser')
     
-    # 移除不需要的標籤
+    # 移除不需要的標籤，但保留可能包含股票數據的標籤
     unwanted_tags = [
         'script', 'style', 'nav', 'header', 'footer', 'aside',
-        'iframe', 'embed', 'object', 'applet', 'form'
+        'iframe', 'embed', 'object', 'applet'
     ]
     
     for tag_name in unwanted_tags:
@@ -72,61 +73,68 @@ def clean_html_content(html_content: str) -> str:
     
     # 移除廣告相關的元素
     ad_patterns = [
-        'ad', 'advertisement', 'banner', 'promo', 'sponsored',
         'gpt-ad', 'google-ad', 'adsense', 'adsbygoogle'
     ]
     
     for pattern in ad_patterns:
-        # 移除包含廣告相關 class 或 id 的元素
         for tag in soup.find_all(attrs={'class': re.compile(pattern, re.I)}):
             tag.decompose()
         for tag in soup.find_all(attrs={'id': re.compile(pattern, re.I)}):
             tag.decompose()
     
-    # 移除所有 JavaScript 事件處理器
+    # 移除包含大量 JavaScript 變數定義的文本節點
+    for element in soup.find_all(text=True):
+        if isinstance(element, str) and len(element) > 200:
+            # 檢查是否包含大量程式碼符號，但不要移除可能的股票代碼或數據
+            code_indicators = ['const ', 'var ', 'function(', 'googletag', 'window.', 'document.']
+            if any(indicator in element for indicator in code_indicators):
+                element.replace_with('')
+    
+    # 移除大部分 JavaScript 事件處理器，但保留一些基本屬性
     for tag in soup.find_all(True):
-        # 移除所有 on* 屬性 (onclick, onmouseover, etc.)
+        # 移除事件處理器
         attrs_to_remove = [attr for attr in tag.attrs if attr.lower().startswith('on')]
         for attr in attrs_to_remove:
             del tag[attr]
         
-        # 移除 style 屬性（保留基本樣式結構但去除內聯樣式）
-        if 'style' in tag.attrs:
+        # 只移除複雜的 style 屬性，保留基本樣式
+        if 'style' in tag.attrs and len(tag['style']) > 100:
             del tag['style']
     
-    # 清理 input 標籤但保留重要的 select 選項
+    # 移除表單元素但保留 select 選項（這些包含重要的篩選條件）
+    for form_tag in soup.find_all('form'):
+        form_tag.decompose()
+    
+    # 移除複雜的 input 元素
     for input_tag in soup.find_all('input'):
-        # 如果不是 hidden 類型且不在表格中，則移除
-        if input_tag.get('type') not in ['hidden'] and not input_tag.find_parent('table'):
+        if input_tag.get('type') not in ['hidden']:
             input_tag.decompose()
     
-    # 保留表格但清理其中的複雜屬性
+    # 簡化表格屬性但保留結構
     for table in soup.find_all('table'):
-        # 簡化表格屬性
         for tag in table.find_all(True):
-            # 保留基本屬性
-            keep_attrs = ['class', 'id', 'colspan', 'rowspan']
+            # 保留重要屬性
+            keep_attrs = ['class', 'id', 'colspan', 'rowspan', 'bgcolor', 'align', 'valign']
             attrs_to_remove = [attr for attr in tag.attrs if attr not in keep_attrs]
             for attr in attrs_to_remove:
                 del tag[attr]
     
-    # 移除空的標籤
+    # 只移除真正空的標籤
     for tag in soup.find_all():
-        if not tag.get_text(strip=True) and not tag.find('img') and not tag.find('table'):
+        if (not tag.get_text(strip=True) and 
+            not tag.find('img') and 
+            not tag.find('table') and 
+            not tag.find('select') and
+            tag.name not in ['br', 'hr', 'tr', 'td', 'th']):
             tag.decompose()
     
-    # 清理多餘的空白和換行
+    # 清理多餘的空白但保留基本格式
     cleaned_html = str(soup)
     
-    # 移除多餘的空行
-    cleaned_html = re.sub(r'\n\s*\n', '\n', cleaned_html)
+    # 移除多餘的空行但不要太激進
+    cleaned_html = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned_html)
     
-    # 移除行首行尾空白
-    lines = cleaned_html.split('\n')
-    cleaned_lines = [line.strip() for line in lines if line.strip()]
-    
-    return '\n'.join(cleaned_lines)
-
+    return cleaned_html
 
 # --------------------
 # /fetch 端點：純 HTTP 抓取
