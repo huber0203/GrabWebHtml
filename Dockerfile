@@ -4,14 +4,20 @@ FROM python:3.11-slim
 # 設定工作目錄
 WORKDIR /app
 
-# 安裝系統依賴（Playwright 需要）
-RUN apt-get update && apt-get install -y \
+# 更新套件列表
+RUN apt-get update
+
+# 安裝基本系統依賴
+RUN apt-get install -y \
     wget \
     gnupg \
-    ca-certificates \
-    fonts-unifont \
-    fonts-ubuntu \
-    fonts-liberation \
+    ca-certificates
+
+# 安裝字體（嘗試安裝，失敗也繼續）
+RUN apt-get install -y fonts-liberation fonts-dejavu-core || true
+
+# 安裝 Playwright 必需的系統庫
+RUN apt-get install -y \
     libglib2.0-0 \
     libnss3 \
     libnspr4 \
@@ -23,7 +29,6 @@ RUN apt-get update && apt-get install -y \
     libgbm1 \
     libxss1 \
     libgtk-3-0 \
-    libatspi2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # 複製 requirements.txt 並安裝 Python 依賴
