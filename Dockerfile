@@ -9,6 +9,21 @@ RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
     ca-certificates \
+    fonts-unifont \
+    fonts-ubuntu \
+    fonts-liberation \
+    libglib2.0-0 \
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libdrm2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libgbm1 \
+    libxss1 \
+    libgtk-3-0 \
+    libatspi2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # 複製 requirements.txt 並安裝 Python 依賴
@@ -17,7 +32,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 安裝 Playwright 瀏覽器
 RUN playwright install chromium
-RUN playwright install-deps chromium
+
+# 跳過有問題的依賴安裝命令
+# RUN playwright install-deps chromium
 
 # 複製應用程式代碼
 COPY . .
