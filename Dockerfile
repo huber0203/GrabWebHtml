@@ -1,5 +1,5 @@
-# 使用 Playwright 官方基礎映像（最穩定的解決方案）
-FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+# 使用 Playwright 官方基礎映像（版本匹配）
+FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 
 # 設定工作目錄
 WORKDIR /app
