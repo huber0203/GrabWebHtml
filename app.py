@@ -10,8 +10,10 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+from bs4 import BeautifulSoup
+import re
 
-app = FastAPI(title="Universal HTML Fetcher", version="1.1.0")
+app = FastAPI(title="Universal HTML Fetcher", version="1.2.0")
 
 
 # --------------------
@@ -43,7 +45,6 @@ def build_session(user_agent: Optional[str]) -> requests.Session:
     })
     return sess
 
-
 def default_filename(url: str, fallback_ext: str = "html") -> str:
     p = urlparse(url)
     base = (p.netloc + p.path).replace("/", "_").strip("_") or "download"
@@ -51,6 +52,80 @@ def default_filename(url: str, fallback_ext: str = "html") -> str:
     if "." not in base.split("_")[-1]:
         base = f"{base}.{fallback_ext}"
     return f"{base}_{ts}"
+
+
+def clean_html_content(html_content: str) -> str:
+    """
+    清理 HTML 內容，移除雜訊，保留重要的表格和文字資訊
+    """
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # 移除不需要的標籤
+    unwanted_tags = [
+        'script', 'style', 'nav', 'header', 'footer', 'aside',
+        'iframe', 'embed', 'object', 'applet', 'form'
+    ]
+    
+    for tag_name in unwanted_tags:
+        for tag in soup.find_all(tag_name):
+            tag.decompose()
+    
+    # 移除廣告相關的元素
+    ad_patterns = [
+        'ad', 'advertisement', 'banner', 'promo', 'sponsored',
+        'gpt-ad', 'google-ad', 'adsense', 'adsbygoogle'
+    ]
+    
+    for pattern in ad_patterns:
+        # 移除包含廣告相關 class 或 id 的元素
+        for tag in soup.find_all(attrs={'class': re.compile(pattern, re.I)}):
+            tag.decompose()
+        for tag in soup.find_all(attrs={'id': re.compile(pattern, re.I)}):
+            tag.decompose()
+    
+    # 移除所有 JavaScript 事件處理器
+    for tag in soup.find_all(True):
+        # 移除所有 on* 屬性 (onclick, onmouseover, etc.)
+        attrs_to_remove = [attr for attr in tag.attrs if attr.lower().startswith('on')]
+        for attr in attrs_to_remove:
+            del tag[attr]
+        
+        # 移除 style 屬性（保留基本樣式結構但去除內聯樣式）
+        if 'style' in tag.attrs:
+            del tag['style']
+    
+    # 清理 input 標籤但保留重要的 select 選項
+    for input_tag in soup.find_all('input'):
+        # 如果不是 hidden 類型且不在表格中，則移除
+        if input_tag.get('type') not in ['hidden'] and not input_tag.find_parent('table'):
+            input_tag.decompose()
+    
+    # 保留表格但清理其中的複雜屬性
+    for table in soup.find_all('table'):
+        # 簡化表格屬性
+        for tag in table.find_all(True):
+            # 保留基本屬性
+            keep_attrs = ['class', 'id', 'colspan', 'rowspan']
+            attrs_to_remove = [attr for attr in tag.attrs if attr not in keep_attrs]
+            for attr in attrs_to_remove:
+                del tag[attr]
+    
+    # 移除空的標籤
+    for tag in soup.find_all():
+        if not tag.get_text(strip=True) and not tag.find('img') and not tag.find('table'):
+            tag.decompose()
+    
+    # 清理多餘的空白和換行
+    cleaned_html = str(soup)
+    
+    # 移除多餘的空行
+    cleaned_html = re.sub(r'\n\s*\n', '\n', cleaned_html)
+    
+    # 移除行首行尾空白
+    lines = cleaned_html.split('\n')
+    cleaned_lines = [line.strip() for line in lines if line.strip()]
+    
+    return '\n'.join(cleaned_lines)
 
 
 # --------------------
@@ -67,6 +142,7 @@ class FetchRequest(BaseModel):
     timeout: float = 20.0
     insecure: bool = False
     filename: Optional[str] = None
+    pretty_content: bool = False
 
 
 @app.post("/fetch")
@@ -94,9 +170,25 @@ def fetch(req: FetchRequest):
 
     content_bytes = resp.content
     origin_ct = resp.headers.get("Content-Type", "application/octet-stream")
+    
+    # 如果需要清理內容且是 HTML
+    if req.pretty_content and "html" in origin_ct.lower():
+        try:
+            html_content = content_bytes.decode(resp.encoding or 'utf-8')
+            cleaned_content = clean_html_content(html_content)
+            content_bytes = cleaned_content.encode('utf-8')
+            origin_ct = "text/html; charset=utf-8"
+        except Exception as e:
+            # 如果清理失敗，返回原始內容
+            pass
+    
     base_name = req.filename or default_filename(str(req.url))
     if ("html" in origin_ct.lower()) and "." not in base_name.split("_")[-1]:
         base_name = f"{base_name}.html"
+    
+    # 如果是清理過的內容，在檔名中標註
+    if req.pretty_content and "html" in origin_ct.lower():
+        base_name = base_name.replace('.html', '_cleaned.html')
 
     ascii_name = base_name.encode("ascii", "ignore").decode("ascii") or "download.html"
     cd = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(base_name)}'
@@ -109,9 +201,11 @@ def fetch(req: FetchRequest):
             "X-Origin-Status": str(resp.status_code),
             "X-Origin-URL": str(resp.url),
             **({"X-Origin-Encoding": resp.encoding} if resp.encoding else {}),
+            **({"X-Content-Cleaned": "true"} if req.pretty_content else {}),
         },
         status_code=200,
     )
+
 
 
 # --------------------
@@ -134,6 +228,7 @@ class RenderRequest(BaseModel):
     filename: Optional[str] = None
     viewport: Optional[Dict[str, int]] = None
     cookies: Optional[Dict[str, str]] = None
+    pretty_content: bool = False
 
 
 @app.post("/render")
@@ -187,16 +282,32 @@ async def render(req: RenderRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Render failed: {e}")
 
+    # 如果需要清理內容
+    if req.pretty_content:
+        try:
+            html = clean_html_content(html)
+        except Exception as e:
+            # 如果清理失敗，返回原始內容
+            pass
+
     base_name = req.filename or default_filename(str(req.url))
     if not base_name.endswith(".html"):
         base_name += ".html"
+    
+    # 如果是清理過的內容，在檔名中標註
+    if req.pretty_content:
+        base_name = base_name.replace('.html', '_cleaned.html')
+        
     ascii_name = base_name.encode("ascii", "ignore").decode("ascii") or "page.html"
     cd = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(base_name)}'
 
     return StreamingResponse(
         BytesIO(html.encode("utf-8")),
         media_type="text/html; charset=utf-8",
-        headers={"Content-Disposition": cd},
+        headers={
+            "Content-Disposition": cd,
+            **({"X-Content-Cleaned": "true"} if req.pretty_content else {}),
+        },
         status_code=200,
     )
 
