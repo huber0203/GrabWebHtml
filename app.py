@@ -12,8 +12,20 @@ from urllib3.util.retry import Retry
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from bs4 import BeautifulSoup
 import re
+import logging
+import sys
 
 app = FastAPI(title="Universal HTML Fetcher", version="1.3.0")
+
+# 設定日誌
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
 # --------------------
@@ -323,14 +335,18 @@ async def render(req: RenderRequest):
 
 
 # --------------------
-# MOPS 專用端點
+# MOPS 專用端點（含詳細日誌）
 # --------------------
 @app.post("/mops-complete")
 async def fetch_mops_complete(req: RenderRequest):
-    """完整的 MOPS 抓取方案：主表 + 所有詳細資料"""
+    """完整的 MOPS 抓取方案：主表 + 所有詳細資料，含詳細日誌"""
+    
+    start_time = datetime.now()
+    logger.info(f"開始 MOPS 完整抓取: {req.url}")
     
     async def _complete_fetch():
         async with async_playwright() as p:
+            logger.info("啟動瀏覽器...")
             browser = await p.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage"]
@@ -345,13 +361,19 @@ async def fetch_mops_complete(req: RenderRequest):
             
             try:
                 # 載入主頁面
+                logger.info("載入主頁面...")
+                page_start = datetime.now()
                 await page.goto(str(req.url), wait_until="networkidle", timeout=60000)
                 await page.wait_for_selector("table", timeout=30000)
+                page_load_time = (datetime.now() - page_start).total_seconds()
+                logger.info(f"主頁面載入完成，耗時: {page_load_time:.2f}秒")
                 
                 # 取得主表格資料
+                logger.info("解析主表格資料...")
                 main_data = await page.evaluate("""
                     () => {
                         const rows = document.querySelectorAll('tr[data-v-d5176dd2]');
+                        console.log(`找到 ${rows.length} 個資料列`);
                         return Array.from(rows).map((row, index) => {
                             const cells = Array.from(row.cells);
                             return {
@@ -367,26 +389,40 @@ async def fetch_mops_complete(req: RenderRequest):
                     }
                 """)
                 
-                print(f"Found {len(main_data)} records in main table")
+                logger.info(f"主表格解析完成，找到 {len(main_data)} 筆記錄")
                 
                 # 為每筆資料取得詳細內容
                 view_buttons = await page.query_selector_all('button:has-text("查看")')
-                print(f"Found {len(view_buttons)} detail buttons")
+                logger.info(f"找到 {len(view_buttons)} 個查看按鈕，開始抓取詳細資料...")
+                
+                # 估算總時間
+                estimated_time = len(view_buttons) * 8  # 每個約8秒
+                logger.info(f"預估總處理時間: {estimated_time//60}分{estimated_time%60}秒")
                 
                 for i, button in enumerate(view_buttons):
+                    detail_start = datetime.now()
                     try:
-                        print(f"Processing detail {i+1}/{len(view_buttons)}")
+                        # 顯示進度
+                        progress = (i + 1) / len(view_buttons) * 100
+                        logger.info(f"處理第 {i+1}/{len(view_buttons)} 個詳細頁面 ({progress:.1f}%)")
+                        
+                        if i < len(main_data):
+                            company_info = f"{main_data[i].get('code', 'N/A')} {main_data[i].get('company', 'N/A')}"
+                            logger.info(f"  公司: {company_info}")
                         
                         # 在新分頁中開啟詳細資料
+                        logger.info(f"  點擊查看按鈕...")
                         async with context.expect_page() as new_page_info:
                             await button.click()
                             detail_page = await new_page_info.value
                         
-                        # 等待詳細頁面載入
+                        logger.info(f"  等待詳細頁面載入...")
                         await detail_page.wait_for_load_state("networkidle", timeout=30000)
                         
                         # 取得詳細內容
                         detail_content = await detail_page.content()
+                        content_size = len(detail_content)
+                        logger.info(f"  取得內容大小: {content_size//1024}KB")
                         
                         # 嘗試解析結構化資料
                         structured_detail = await detail_page.evaluate("""
@@ -399,10 +435,13 @@ async def fetch_mops_complete(req: RenderRequest):
                                     page_text: text_content.slice(0, 3000),
                                     title: document.title,
                                     has_content: text_content.length > 100,
-                                    url: window.location.href
+                                    url: window.location.href,
+                                    content_length: text_content.length
                                 };
                             }
                         """)
+                        
+                        logger.info(f"  解析完成 - 表格數: {structured_detail.get('tables_count', 0)}, 內容長度: {structured_detail.get('content_length', 0)}")
                         
                         await detail_page.close()
                         
@@ -413,25 +452,38 @@ async def fetch_mops_complete(req: RenderRequest):
                                 "detail": {
                                     "html": detail_content,
                                     "structured": structured_detail,
-                                    "fetched": True
+                                    "fetched": True,
+                                    "fetch_time_seconds": (datetime.now() - detail_start).total_seconds()
                                 }
                             })
+                        
+                        detail_time = (datetime.now() - detail_start).total_seconds()
+                        remaining = len(view_buttons) - (i + 1)
+                        eta_seconds = remaining * detail_time
+                        logger.info(f"  完成，耗時: {detail_time:.2f}秒，預估剩餘時間: {eta_seconds//60:.0f}分{eta_seconds%60:.0f}秒")
                         
                         # 避免請求過快
                         await page.wait_for_timeout(1000)
                         
                     except Exception as e:
-                        print(f"Error fetching detail {i}: {e}")
+                        error_msg = str(e)
+                        logger.error(f"  錯誤: {error_msg}")
+                        
                         if i < len(main_data):
                             all_results.append({
                                 **main_data[i],
                                 "detail": {
-                                    "error": str(e),
-                                    "fetched": False
+                                    "error": error_msg,
+                                    "fetched": False,
+                                    "fetch_time_seconds": (datetime.now() - detail_start).total_seconds()
                                 }
                             })
                 
+                total_time = (datetime.now() - start_time).total_seconds()
+                logger.info(f"所有詳細頁面處理完成！總耗時: {total_time//60:.0f}分{total_time%60:.1f}秒")
+                
             finally:
+                logger.info("關閉瀏覽器...")
                 await context.close()
                 await browser.close()
             
@@ -439,14 +491,89 @@ async def fetch_mops_complete(req: RenderRequest):
 
     try:
         results = await _complete_fetch()
+        
+        # 統計結果
+        success_count = sum(1 for r in results if r.get('detail', {}).get('fetched', False))
+        total_time = (datetime.now() - start_time).total_seconds()
+        
+        logger.info(f"抓取完成統計:")
+        logger.info(f"  成功: {success_count}/{len(results)} 筆")
+        logger.info(f"  總耗時: {total_time//60:.0f}分{total_time%60:.1f}秒")
+        logger.info(f"  平均每筆: {total_time/len(results):.1f}秒" if results else "  無資料")
+        
         return {
             "success": True,
             "total_records": len(results),
+            "successful_details": success_count,
+            "failed_details": len(results) - success_count,
+            "total_time_seconds": total_time,
+            "average_time_per_record": total_time / len(results) if results else 0,
             "data": results,
             "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
+        total_time = (datetime.now() - start_time).total_seconds()
+        logger.error(f"抓取失敗: {str(e)}，耗時: {total_time:.1f}秒")
         raise HTTPException(status_code=502, detail=f"Complete fetch failed: {e}")
+
+
+@app.post("/mops-quick-test")
+async def fetch_mops_quick_test(req: RenderRequest):
+    """快速測試版本：只抓取前3筆詳細資料"""
+    
+    logger.info(f"開始 MOPS 快速測試: {req.url}")
+    
+    async def _quick_test():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            context = await browser.new_context()
+            page = await context.new_page()
+            
+            try:
+                logger.info("載入頁面...")
+                await page.goto(str(req.url), wait_until="networkidle", timeout=60000)
+                await page.wait_for_selector("table", timeout=30000)
+                logger.info("頁面載入完成")
+                
+                view_buttons = await page.query_selector_all('button:has-text("查看")')
+                test_count = min(3, len(view_buttons))  # 只測試前3個
+                logger.info(f"找到 {len(view_buttons)} 個按鈕，測試前 {test_count} 個")
+                
+                results = []
+                for i in range(test_count):
+                    logger.info(f"測試第 {i+1} 個按鈕...")
+                    try:
+                        async with context.expect_page() as new_page_info:
+                            await view_buttons[i].click()
+                            detail_page = await new_page_info.value
+                        
+                        await detail_page.wait_for_load_state("networkidle", timeout=20000)
+                        content = await detail_page.content()
+                        await detail_page.close()
+                        
+                        results.append({
+                            "index": i,
+                            "success": True,
+                            "content_size": len(content),
+                            "has_content": len(content) > 1000
+                        })
+                        logger.info(f"  成功，內容大小: {len(content)//1024}KB")
+                        
+                    except Exception as e:
+                        logger.error(f"  失敗: {str(e)}")
+                        results.append({"index": i, "success": False, "error": str(e)})
+                
+                return results
+                
+            finally:
+                await context.close()
+                await browser.close()
+    
+    results = await _quick_test()
+    success_rate = sum(1 for r in results if r.get("success", False)) / len(results) * 100 if results else 0
+    logger.info(f"快速測試完成，成功率: {success_rate:.1f}%")
+    
+    return {"test_results": results, "success_rate": success_rate}
 
 
 @app.post("/mops-analyze-buttons")
