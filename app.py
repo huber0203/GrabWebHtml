@@ -421,7 +421,7 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                                     "alert_message": alert_message
                                 }
                                 
-                                if global_index < len(main_data):
+                                if global_index < len(main_data) and main_data[global_index]:
                                     return {
                                         **main_data[global_index],
                                         "detail": {
@@ -500,7 +500,7 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                         retry_suffix = f" (重試{attempt}次)" if attempt > 0 else ""
                         logger.info(f"    [{index+1}] 完成，{fetch_time:.1f}秒，{len(detail_content)//1024}KB{retry_suffix}")
                         
-                        if global_index < len(main_data):
+                        if global_index < len(main_data) and main_data[global_index]:
                             return {
                                 **main_data[global_index],
                                 "detail": {
@@ -514,8 +514,19 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                         else:
                             return {
                                 "index": global_index,
-                                "error": "Index out of range",
-                                "detail": {"fetched": False, "error": "Index out of range", "retry_count": attempt}
+                                "date": "",
+                                "time": "",
+                                "code": "",
+                                "company": "",
+                                "subject": "",
+                                "hasDetail": False,
+                                "detail": {
+                                    "html": detail_content,
+                                    "structured": structured_detail,
+                                    "fetched": True,
+                                    "fetch_time_seconds": fetch_time,
+                                    "retry_count": attempt
+                                }
                             }
                     
                 except Exception as e:
