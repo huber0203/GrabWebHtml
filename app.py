@@ -478,7 +478,7 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                             return
                         
                         dialog_processed = True
-                        alert_message = dialog.message
+                        alert_message = dialog.message or "系統Alert訊息"
                         alert_handled = True
                         logger.warning(f"    [{index+1}] 捕獲 Alert: {alert_message}")
                         
@@ -502,33 +502,20 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                                 # 如果有 alert，直接返回 alert 資訊
                                 logger.info(f"    [{index+1}] Alert 處理完成: {alert_message}")
                                 
-                                alert_html = f"""<!DOCTYPE html>
-<html>
-<head><title>Alert Message</title></head>
-<body>
-<div class="alert-message">
-<h3>系統提示</h3>
-<p>{alert_message}</p>
-</div>
-</body>
-</html>"""
-                                
-                                alert_structured = {
-                                    "tables_count": 0,
-                                    "page_text": f"系統提示: {alert_message}",
-                                    "title": "Alert Message",
-                                    "has_content": True,
-                                    "url": "alert://system-message",
-                                    "content_length": len(alert_message),
-                                    "is_alert": True,
-                                    "alert_message": alert_message
-                                }
+                                safe_alert_message = alert_message or "系統提示：無法取得詳細資料"
                                 
                                 return {
                                     **current_record,
                                     "detail": {
-                                        "html": alert_html,
-                                        "structured": alert_structured,
+                                        "html": "<html><body>Alert</body></html>",
+                                        "structured": {
+                                            "tables_count": 0,
+                                            "page_text": safe_alert_message,
+                                            "title": "",
+                                            "has_content": True,
+                                            "url": "about:blank",
+                                            "content_length": len(safe_alert_message)
+                                        },
                                         "fetched": True,
                                         "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
                                         "retry_count": attempt
