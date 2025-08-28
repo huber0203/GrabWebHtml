@@ -353,6 +353,7 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
             for attempt in range(max_retries):
                 detail_page = None
                 alert_message = None
+                dialog_handler = None
                 
                 try:
                     if global_index < len(main_data):
@@ -362,33 +363,50 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                         else:
                             logger.info(f"    [{index+1}] 重試 {attempt} - {company_name}")
                     
-                    # 設定 alert 監聽器 - 在點擊前設定
+                    # 設定 alert 監聽器 - 在點擊前設定，使用同步標記避免重複處理
                     alert_handled = False
+                    dialog_processed = False
                     
-                    def handle_dialog(dialog):
-                        nonlocal alert_message, alert_handled
+                    async def handle_dialog(dialog):
+                        nonlocal alert_message, alert_handled, dialog_processed
+                        if dialog_processed:
+                            return  # 已經處理過了，直接返回
+                        
+                        dialog_processed = True
                         alert_message = dialog.message
                         alert_handled = True
                         logger.warning(f"    [{index+1}] 捕獲 Alert: {alert_message}")
-                        # 自動接受 dialog
-                        asyncio.create_task(dialog.accept())
+                        
+                        try:
+                            # 同步處理 dialog，不用 asyncio.create_task
+                            await dialog.accept()
+                        except Exception as e:
+                            logger.warning(f"    [{index+1}] Dialog 已被處理: {e}")
                     
-                    context.on("dialog", handle_dialog)
+                    dialog_handler = handle_dialog
+                    context.on("dialog", dialog_handler)
                     
                     try:
                         # 開啟新分頁，但處理可能的 alert
-                        async with context.expect_page(timeout=20000) as new_page_info:
-                            await button.click()
+                        page_task = context.expect_page(timeout=20000)
+                        
+                        # 點擊按鈕
+                        await button.click()
+                        
+                        # 短暫等待，看是否有 alert 出現
+                        await asyncio.sleep(1.5)
+                        
+                        if alert_handled:
+                            # 如果有 alert，取消等待新頁面並返回 alert 資訊
+                            try:
+                                page_task.cancel()
+                            except:
+                                pass
                             
-                            # 短暫等待，看是否有 alert 出現
-                            await asyncio.sleep(1)
+                            logger.info(f"    [{index+1}] Alert 處理完成: {alert_message}")
                             
-                            if alert_handled:
-                                # 如果有 alert，返回標準格式但在 structured 中記錄 alert
-                                logger.info(f"    [{index+1}] Alert 處理完成: {alert_message}")
-                                
-                                # 創建一個模擬的 HTML 內容，包含 alert 訊息
-                                alert_html = f"""<!DOCTYPE html>
+                            # 創建一個模擬的 HTML 內容，包含 alert 訊息
+                            alert_html = f"""<!DOCTYPE html>
 <html>
 <head><title>Alert Message</title></head>
 <body>
@@ -398,53 +416,57 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
 </div>
 </body>
 </html>"""
-                                
-                                alert_structured = {
-                                    "tables_count": 0,
-                                    "page_text": f"系統提示: {alert_message}",
-                                    "title": "Alert Message",
-                                    "has_content": True,
-                                    "url": "alert://system-message",
-                                    "content_length": len(alert_message),
-                                    "is_alert": True,
-                                    "alert_message": alert_message
-                                }
-                                
-                                if global_index < len(main_data):
-                                    return {
-                                        **main_data[global_index],
-                                        "detail": {
-                                            "html": alert_html,
-                                            "structured": alert_structured,
-                                            "fetched": True,  # 技術上我們確實"取得"了內容（alert）
-                                            "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
-                                            "retry_count": attempt
-                                        }
-                                    }
-                                else:
-                                    return {
-                                        "index": global_index,
-                                        "date": "",
-                                        "time": "",
-                                        "code": "",
-                                        "company": "",
-                                        "subject": "",
-                                        "hasDetail": True,
-                                        "detail": {
-                                            "html": alert_html,
-                                            "structured": alert_structured,
-                                            "fetched": True,
-                                            "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
-                                            "retry_count": attempt
-                                        }
-                                    }
                             
-                            # 沒有 alert，正常處理新頁面
-                            detail_page = await new_page_info.value
+                            alert_structured = {
+                                "tables_count": 0,
+                                "page_text": f"系統提示: {alert_message}",
+                                "title": "Alert Message",
+                                "has_content": True,
+                                "url": "alert://system-message",
+                                "content_length": len(alert_message),
+                                "is_alert": True,
+                                "alert_message": alert_message
+                            }
+                            
+                            if global_index < len(main_data):
+                                return {
+                                    **main_data[global_index],
+                                    "detail": {
+                                        "html": alert_html,
+                                        "structured": alert_structured,
+                                        "fetched": True,
+                                        "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
+                                        "retry_count": attempt
+                                    }
+                                }
+                            else:
+                                return {
+                                    "index": global_index,
+                                    "date": "",
+                                    "time": "",
+                                    "code": "",
+                                    "company": "",
+                                    "subject": "",
+                                    "hasDetail": True,
+                                    "detail": {
+                                        "html": alert_html,
+                                        "structured": alert_structured,
+                                        "fetched": True,
+                                        "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
+                                        "retry_count": attempt
+                                    }
+                                }
+                        
+                        # 沒有 alert，正常處理新頁面
+                        detail_page = await page_task
                     
                     finally:
                         # 移除 dialog 監聽器
-                        context.remove_listener("dialog", handle_dialog)
+                        if dialog_handler:
+                            try:
+                                context.remove_listener("dialog", dialog_handler)
+                            except:
+                                pass
                     
                     # 如果已經處理了 alert，就不繼續了
                     if alert_handled:
@@ -493,8 +515,7 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                                     "structured": structured_detail,
                                     "fetched": True,
                                     "fetch_time_seconds": fetch_time,
-                                    "retry_count": attempt,
-                                    "is_alert": False
+                                    "retry_count": attempt
                                 }
                             }
                         else:
@@ -514,6 +535,13 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                         except:
                             pass
                         detail_page = None
+                    
+                    # 移除 dialog 監聽器
+                    if dialog_handler:
+                        try:
+                            context.remove_listener("dialog", dialog_handler)
+                        except:
+                            pass
                     
                     # 如果是因為 alert 導致的錯誤，但我們已經處理了 alert，就不重試了
                     if alert_handled:
