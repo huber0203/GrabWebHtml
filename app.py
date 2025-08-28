@@ -720,30 +720,44 @@ async def fetch_mops_concurrent(req: RenderRequest):
                 page_load_time = (datetime.now() - page_start).total_seconds()
                 logger.info(f"主頁面載入完成，耗時: {page_load_time:.2f}秒")
                 
-                # 取得主表格資料
+                # 取得主表格資料 - 使用更精確的選擇器
                 logger.info("解析主表格資料...")
-                main_data = await page.evaluate("""
+                main_data_and_buttons = await page.evaluate("""
                     () => {
-                        const rows = document.querySelectorAll('tr[data-v-d5176dd2]');
-                        return Array.from(rows).map((row, index) => {
+                        /* 使用更精確的選擇器，只抓取實際的資料列 */
+                        const dataRows = document.querySelectorAll('table tbody tr');
+                        const results = [];
+                        
+                        Array.from(dataRows).forEach((row, index) => {
                             const cells = Array.from(row.cells);
-                            return {
-                                index: index,
-                                date: cells[0]?.querySelector('span')?.textContent?.trim(),
-                                time: cells[1]?.querySelector('span')?.textContent?.trim(),
-                                code: cells[2]?.querySelector('span')?.textContent?.trim(),
-                                company: cells[3]?.querySelector('span')?.textContent?.trim(),
-                                subject: cells[4]?.querySelector('span')?.textContent?.trim(),
-                                hasDetail: cells[5]?.querySelector('button') !== null
-                            };
+                            
+                            /* 檢查是否為有效的資料列（必須有足夠的欄位且有查看按鈕） */
+                            const hasViewButton = row.querySelector('button') && 
+                                                 row.querySelector('button').textContent.includes('查看');
+                            
+                            if (cells.length >= 6 && hasViewButton) {
+                                results.push({
+                                    index: results.length, /* 使用有效資料的索引 */
+                                    date: cells[0]?.querySelector('span')?.textContent?.trim() || cells[0]?.textContent?.trim(),
+                                    time: cells[1]?.querySelector('span')?.textContent?.trim() || cells[1]?.textContent?.trim(),
+                                    code: cells[2]?.querySelector('span')?.textContent?.trim() || cells[2]?.textContent?.trim(),
+                                    company: cells[3]?.querySelector('span')?.textContent?.trim() || cells[3]?.textContent?.trim(),
+                                    subject: cells[4]?.querySelector('span')?.textContent?.trim() || cells[4]?.textContent?.trim(),
+                                    hasDetail: hasViewButton,
+                                    rowElement: index /* 保存原始索引以便後續匹配 */
+                                });
+                            }
                         });
+                        
+                        return results;
                     }
                 """)
                 
-                logger.info(f"主表格解析完成，找到 {len(main_data)} 筆記錄")
+                main_data = main_data_and_buttons  # 保持向後兼容
+                logger.info(f"主表格解析完成，找到 {len(main_data)} 筆有效記錄")
                 
-                # 取得所有查看按鈕
-                view_buttons = await page.query_selector_all('button:has-text("查看")')
+                # 只從有資料的列中找查看按鈕
+                view_buttons = await page.query_selector_all('table tbody tr button:has-text("查看")')
                 logger.info(f"找到 {len(view_buttons)} 個查看按鈕")
                 
                 # 估算總時間（併發版本）
@@ -862,25 +876,37 @@ async def fetch_mops_flexible(req: FlexibleMopsRequest):
                 # 取得主表格資料
                 main_data = await page.evaluate("""
                     () => {
-                        const rows = document.querySelectorAll('tr[data-v-d5176dd2]');
-                        return Array.from(rows).map((row, index) => {
+                        /* 使用更精確的選擇器，只抓取實際的資料列 */
+                        const dataRows = document.querySelectorAll('table tbody tr');
+                        const results = [];
+                        
+                        Array.from(dataRows).forEach((row, index) => {
                             const cells = Array.from(row.cells);
-                            return {
-                                index: index,
-                                date: cells[0]?.querySelector('span')?.textContent?.trim(),
-                                time: cells[1]?.querySelector('span')?.textContent?.trim(),
-                                code: cells[2]?.querySelector('span')?.textContent?.trim(),
-                                company: cells[3]?.querySelector('span')?.textContent?.trim(),
-                                subject: cells[4]?.querySelector('span')?.textContent?.trim(),
-                                hasDetail: cells[5]?.querySelector('button') !== null
-                            };
+                            
+                            /* 檢查是否為有效的資料列（必須有足夠的欄位且有查看按鈕） */
+                            const hasViewButton = row.querySelector('button') && 
+                                                 row.querySelector('button').textContent.includes('查看');
+                            
+                            if (cells.length >= 6 && hasViewButton) {
+                                results.push({
+                                    index: results.length, /* 使用有效資料的索引 */
+                                    date: cells[0]?.querySelector('span')?.textContent?.trim() || cells[0]?.textContent?.trim(),
+                                    time: cells[1]?.querySelector('span')?.textContent?.trim() || cells[1]?.textContent?.trim(),
+                                    code: cells[2]?.querySelector('span')?.textContent?.trim() || cells[2]?.textContent?.trim(),
+                                    company: cells[3]?.querySelector('span')?.textContent?.trim() || cells[3]?.textContent?.trim(),
+                                    subject: cells[4]?.querySelector('span')?.textContent?.trim() || cells[4]?.textContent?.trim(),
+                                    hasDetail: hasViewButton
+                                });
+                            }
                         });
+                        
+                        return results;
                     }
                 """)
                 
                 logger.info(f"找到 {len(main_data)} 筆記錄")
                 
-                view_buttons = await page.query_selector_all('button:has-text("查看")')
+                view_buttons = await page.query_selector_all('table tbody tr button:has-text("查看")')
                 logger.info(f"找到 {len(view_buttons)} 個查看按鈕")
                 
                 all_results = []
