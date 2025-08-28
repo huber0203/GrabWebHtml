@@ -339,91 +339,136 @@ async def render(req: RenderRequest):
 # MOPS 併發處理輔助函數
 # --------------------
 async def _process_batch_concurrent(context, buttons, main_data, offset, max_concurrent):
-    """併發處理一批按鈕"""
+    """併發處理一批按鈕 - 含重試機制"""
     
     semaphore = asyncio.Semaphore(max_concurrent)  # 限制同時開啟的頁面數
     
     async def _process_single_button(button, index):
-        """處理單個按鈕"""
+        """處理單個按鈕 - 含重試機制"""
         async with semaphore:
             detail_start = datetime.now()
             global_index = offset + index
+            max_retries = 3
             
-            try:
-                if global_index < len(main_data):
-                    company_name = main_data[global_index].get('company', 'N/A')
-                    logger.info(f"    [{index+1}] 處理 {company_name}")
-                
-                # 開啟新分頁
-                async with context.expect_page() as new_page_info:
-                    await button.click()
-                    detail_page = await new_page_info.value
-                
-                # 等待載入
-                await detail_page.wait_for_load_state("networkidle", timeout=25000)
-                
-                # 取得內容
-                detail_content = await detail_page.content()
-                
-                # 解析結構化資料
-                structured_detail = await detail_page.evaluate("""
-                    () => {
-                        const tables = Array.from(document.querySelectorAll('table'));
-                        const text_content = document.body.innerText;
-                        
+            for attempt in range(max_retries):
+                detail_page = None
+                try:
+                    if global_index < len(main_data):
+                        company_name = main_data[global_index].get('company', 'N/A')
+                        if attempt == 0:
+                            logger.info(f"    [{index+1}] 處理 {company_name}")
+                        else:
+                            logger.info(f"    [{index+1}] 重試 {attempt} - {company_name}")
+                    
+                    # 開啟新分頁
+                    async with context.expect_page(timeout=20000) as new_page_info:
+                        await button.click()
+                        detail_page = await new_page_info.value
+                    
+                    # 檢查頁面是否正常
+                    if detail_page.is_closed():
+                        raise Exception("Page was closed immediately after opening")
+                    
+                    # 等待載入
+                    await detail_page.wait_for_load_state("networkidle", timeout=25000)
+                    
+                    # 取得內容
+                    detail_content = await detail_page.content()
+                    
+                    # 解析結構化資料
+                    structured_detail = await detail_page.evaluate("""
+                        () => {
+                            const tables = Array.from(document.querySelectorAll('table'));
+                            const text_content = document.body.innerText;
+                            
+                            return {
+                                tables_count: tables.length,
+                                page_text: text_content.slice(0, 2000),
+                                title: document.title,
+                                has_content: text_content.length > 100,
+                                url: window.location.href,
+                                content_length: text_content.length
+                            };
+                        }
+                    """)
+                    
+                    await detail_page.close()
+                    detail_page = None
+                    
+                    fetch_time = (datetime.now() - detail_start).total_seconds()
+                    retry_suffix = f" (重試{attempt}次)" if attempt > 0 else ""
+                    logger.info(f"    [{index+1}] 完成，{fetch_time:.1f}秒，{len(detail_content)//1024}KB{retry_suffix}")
+                    
+                    if global_index < len(main_data):
                         return {
-                            tables_count: tables.length,
-                            page_text: text_content.slice(0, 2000),
-                            title: document.title,
-                            has_content: text_content.length > 100,
-                            url: window.location.href,
-                            content_length: text_content.length
-                        };
-                    }
-                """)
-                
-                await detail_page.close()
-                
-                fetch_time = (datetime.now() - detail_start).total_seconds()
-                logger.info(f"    [{index+1}] 完成，{fetch_time:.1f}秒，{len(detail_content)//1024}KB")
-                
-                if global_index < len(main_data):
-                    return {
-                        **main_data[global_index],
-                        "detail": {
-                            "html": detail_content,
-                            "structured": structured_detail,
-                            "fetched": True,
-                            "fetch_time_seconds": fetch_time
+                            **main_data[global_index],
+                            "detail": {
+                                "html": detail_content,
+                                "structured": structured_detail,
+                                "fetched": True,
+                                "fetch_time_seconds": fetch_time,
+                                "retry_count": attempt
+                            }
                         }
-                    }
-                else:
-                    return {
-                        "index": global_index,
-                        "error": "Index out of range",
-                        "detail": {"fetched": False, "error": "Index out of range"}
-                    }
-                
-            except Exception as e:
-                error_msg = str(e)
-                fetch_time = (datetime.now() - detail_start).total_seconds()
-                logger.error(f"    [{index+1}] 錯誤: {error_msg}")
-                
-                if global_index < len(main_data):
-                    return {
-                        **main_data[global_index],
-                        "detail": {
-                            "error": error_msg,
-                            "fetched": False,
-                            "fetch_time_seconds": fetch_time
+                    else:
+                        return {
+                            "index": global_index,
+                            "error": "Index out of range",
+                            "detail": {"fetched": False, "error": "Index out of range", "retry_count": attempt}
                         }
-                    }
-                else:
-                    return {
-                        "index": global_index,
-                        "error": error_msg,
-                        "detail": {"fetched": False, "error": error_msg}
-                    }
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    
+                    # 確保頁面被關閉
+                    if detail_page and not detail_page.is_closed():
+                        try:
+                            await detail_page.close()
+                        except:
+                            pass
+                        detail_page = None
+                    
+                    # 判斷是否應該重試
+                    should_retry = (
+                        attempt < max_retries - 1 and
+                        ("closed" in error_msg.lower() or 
+                         "timeout" in error_msg.lower() or
+                         "target page" in error_msg.lower() or
+                         "context" in error_msg.lower())
+                    )
+                    
+                    if should_retry:
+                        retry_delay = min(2 ** attempt, 5)  # 指數退避，最多5秒
+                        logger.warning(f"    [{index+1}] 重試 {attempt+1}/{max_retries}: {error_msg}")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    else:
+                        # 最終失敗
+                        fetch_time = (datetime.now() - detail_start).total_seconds()
+                        logger.error(f"    [{index+1}] 最終失敗 (重試{attempt}次): {error_msg}")
+                        
+                        if global_index < len(main_data):
+                            return {
+                                **main_data[global_index],
+                                "detail": {
+                                    "error": error_msg,
+                                    "fetched": False,
+                                    "fetch_time_seconds": fetch_time,
+                                    "retry_count": attempt,
+                                    "final_failure": True
+                                }
+                            }
+                        else:
+                            return {
+                                "index": global_index,
+                                "error": error_msg,
+                                "detail": {
+                                    "fetched": False, 
+                                    "error": error_msg, 
+                                    "retry_count": attempt,
+                                    "final_failure": True
+                                }
+                            }
     
     # 併發處理所有按鈕
     tasks = [
