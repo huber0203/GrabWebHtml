@@ -348,7 +348,7 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
         async with semaphore:
             detail_start = datetime.now()
             global_index = offset + index
-            max_retries = 3
+            max_retries = 10
             
             for attempt in range(max_retries):
                 detail_page = None
