@@ -13,7 +13,7 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from bs4 import BeautifulSoup
 import re
 
-app = FastAPI(title="Universal HTML Fetcher", version="1.2.0")
+app = FastAPI(title="Universal HTML Fetcher", version="1.3.0")
 
 
 # --------------------
@@ -137,7 +137,7 @@ def clean_html_content(html_content: str) -> str:
     return cleaned_html
 
 # --------------------
-# /fetch 端點：純 HTTP 抓取
+# 請求模型
 # --------------------
 class FetchRequest(BaseModel):
     url: AnyHttpUrl
@@ -153,6 +153,29 @@ class FetchRequest(BaseModel):
     pretty_content: bool = False
 
 
+class RenderRequest(BaseModel):
+    url: AnyHttpUrl
+    referer: Optional[str] = "https://goodinfo.tw/tw/index.asp"
+    user_agent: Optional[str] = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    wait_until: Literal["load", "domcontentloaded", "networkidle"] = "domcontentloaded"
+    wait_selector: Optional[str] = Field(
+        None, description="等待指定 selector 再抓取，例如 'table'"
+    )
+    timeout_ms: int = 60000
+    disable_js: bool = False
+    filename: Optional[str] = None
+    viewport: Optional[Dict[str, int]] = None
+    cookies: Optional[Dict[str, str]] = None
+    pretty_content: bool = False
+
+
+# --------------------
+# /fetch 端點：純 HTTP 抓取
+# --------------------
 @app.post("/fetch")
 def fetch(req: FetchRequest):
     sess = build_session(req.user_agent)
@@ -215,30 +238,9 @@ def fetch(req: FetchRequest):
     )
 
 
-
 # --------------------
 # /render 端點：JS 渲染抓取
 # --------------------
-class RenderRequest(BaseModel):
-    url: AnyHttpUrl
-    referer: Optional[str] = "https://goodinfo.tw/tw/index.asp"
-    user_agent: Optional[str] = (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-    wait_until: Literal["load", "domcontentloaded", "networkidle"] = "domcontentloaded"
-    wait_selector: Optional[str] = Field(
-        None, description="等待指定 selector 再抓取，例如 'table'"
-    )
-    timeout_ms: int = 60000
-    disable_js: bool = False
-    filename: Optional[str] = None
-    viewport: Optional[Dict[str, int]] = None
-    cookies: Optional[Dict[str, str]] = None
-    pretty_content: bool = False
-
-
 @app.post("/render")
 async def render(req: RenderRequest):
     async def _once():
@@ -320,11 +322,196 @@ async def render(req: RenderRequest):
     )
 
 
+# --------------------
+# MOPS 專用端點
+# --------------------
+@app.post("/mops-complete")
+async def fetch_mops_complete(req: RenderRequest):
+    """完整的 MOPS 抓取方案：主表 + 所有詳細資料"""
+    
+    async def _complete_fetch():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            context = await browser.new_context(
+                user_agent=req.user_agent,
+                viewport={"width": 1920, "height": 1080},
+            )
+            page = await context.new_page()
+            
+            all_results = []
+            
+            try:
+                # 載入主頁面
+                await page.goto(str(req.url), wait_until="networkidle", timeout=60000)
+                await page.wait_for_selector("table", timeout=30000)
+                
+                # 取得主表格資料
+                main_data = await page.evaluate("""
+                    () => {
+                        const rows = document.querySelectorAll('tr[data-v-d5176dd2]');
+                        return Array.from(rows).map((row, index) => {
+                            const cells = Array.from(row.cells);
+                            return {
+                                index: index,
+                                date: cells[0]?.querySelector('span')?.textContent?.trim(),
+                                time: cells[1]?.querySelector('span')?.textContent?.trim(),
+                                code: cells[2]?.querySelector('span')?.textContent?.trim(),
+                                company: cells[3]?.querySelector('span')?.textContent?.trim(),
+                                subject: cells[4]?.querySelector('span')?.textContent?.trim(),
+                                hasDetail: cells[5]?.querySelector('button') !== null
+                            };
+                        });
+                    }
+                """)
+                
+                print(f"Found {len(main_data)} records in main table")
+                
+                # 為每筆資料取得詳細內容
+                view_buttons = await page.query_selector_all('button:has-text("查看")')
+                print(f"Found {len(view_buttons)} detail buttons")
+                
+                for i, button in enumerate(view_buttons):
+                    try:
+                        print(f"Processing detail {i+1}/{len(view_buttons)}")
+                        
+                        # 在新分頁中開啟詳細資料
+                        async with context.expect_page() as new_page_info:
+                            await button.click()
+                            detail_page = await new_page_info.value
+                        
+                        # 等待詳細頁面載入
+                        await detail_page.wait_for_load_state("networkidle", timeout=30000)
+                        
+                        # 取得詳細內容
+                        detail_content = await detail_page.content()
+                        
+                        # 嘗試解析結構化資料
+                        structured_detail = await detail_page.evaluate("""
+                            () => {
+                                const tables = Array.from(document.querySelectorAll('table'));
+                                const text_content = document.body.innerText;
+                                
+                                return {
+                                    tables_count: tables.length,
+                                    page_text: text_content.slice(0, 3000),
+                                    title: document.title,
+                                    has_content: text_content.length > 100,
+                                    url: window.location.href
+                                };
+                            }
+                        """)
+                        
+                        await detail_page.close()
+                        
+                        # 合併主資料和詳細資料
+                        if i < len(main_data):
+                            all_results.append({
+                                **main_data[i],
+                                "detail": {
+                                    "html": detail_content,
+                                    "structured": structured_detail,
+                                    "fetched": True
+                                }
+                            })
+                        
+                        # 避免請求過快
+                        await page.wait_for_timeout(1000)
+                        
+                    except Exception as e:
+                        print(f"Error fetching detail {i}: {e}")
+                        if i < len(main_data):
+                            all_results.append({
+                                **main_data[i],
+                                "detail": {
+                                    "error": str(e),
+                                    "fetched": False
+                                }
+                            })
+                
+            finally:
+                await context.close()
+                await browser.close()
+            
+            return all_results
+
+    try:
+        results = await _complete_fetch()
+        return {
+            "success": True,
+            "total_records": len(results),
+            "data": results,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Complete fetch failed: {e}")
+
+
+@app.post("/mops-analyze-buttons")
+async def analyze_mops_buttons(req: RenderRequest):
+    """分析查看按鈕的實際連結或事件處理"""
+    
+    async def _analyze_buttons():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
+            
+            try:
+                await page.goto(str(req.url), wait_until="networkidle", timeout=60000)
+                await page.wait_for_selector("table", timeout=30000)
+                
+                # 分析按鈕的屬性和事件
+                buttons_info = await page.evaluate("""
+                    () => {
+                        const buttons = Array.from(document.querySelectorAll('button')).filter(btn => 
+                            btn.textContent.includes('查看') || btn.hasAttribute('target')
+                        );
+                        
+                        return buttons.map((btn, index) => {
+                            const row = btn.closest('tr');
+                            const cells = row ? Array.from(row.cells).map(cell => {
+                                const span = cell.querySelector('span');
+                                return span ? span.textContent.trim() : cell.textContent.trim();
+                            }) : [];
+                            
+                            return {
+                                index: index,
+                                innerHTML: btn.innerHTML,
+                                attributes: Object.fromEntries(
+                                    Array.from(btn.attributes).map(attr => [attr.name, attr.value])
+                                ),
+                                onclick: btn.onclick ? btn.onclick.toString() : null,
+                                rowData: cells,
+                                parentHTML: btn.parentElement.innerHTML.slice(0, 200)
+                            };
+                        });
+                    }
+                """)
+                
+                return buttons_info
+                
+            finally:
+                await context.close()
+                await browser.close()
+
+    result = await _analyze_buttons()
+    return {"buttons_analysis": result}
+
+
+# --------------------
+# 健康檢查
+# --------------------
 @app.get("/healthz")
 def healthz():
-    return {"ok": True}
+    return {"ok": True, "version": "1.3.0"}
 
 
+# --------------------
+# 主程式入口
+# --------------------
 if __name__ == "__main__":
     import uvicorn
     import os
