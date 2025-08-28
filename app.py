@@ -388,25 +388,18 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                     
                     try:
                         # 開啟新分頁，但處理可能的 alert
-                        page_task = context.expect_page(timeout=20000)
-                        
-                        # 點擊按鈕
-                        await button.click()
-                        
-                        # 短暫等待，看是否有 alert 出現
-                        await asyncio.sleep(1.5)
-                        
-                        if alert_handled:
-                            # 如果有 alert，取消等待新頁面並返回 alert 資訊
-                            try:
-                                page_task.cancel()
-                            except:
-                                pass
+                        async with context.expect_page(timeout=20000) as new_page_info:
+                            await button.click()
                             
-                            logger.info(f"    [{index+1}] Alert 處理完成: {alert_message}")
+                            # 短暫等待，看是否有 alert 出現
+                            await asyncio.sleep(1.5)
                             
-                            # 創建一個模擬的 HTML 內容，包含 alert 訊息
-                            alert_html = f"""<!DOCTYPE html>
+                            if alert_handled:
+                                # 如果有 alert，直接返回 alert 資訊，不需要等待新頁面
+                                logger.info(f"    [{index+1}] Alert 處理完成: {alert_message}")
+                                
+                                # 創建一個模擬的 HTML 內容，包含 alert 訊息
+                                alert_html = f"""<!DOCTYPE html>
 <html>
 <head><title>Alert Message</title></head>
 <body>
@@ -416,49 +409,49 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
 </div>
 </body>
 </html>"""
-                            
-                            alert_structured = {
-                                "tables_count": 0,
-                                "page_text": f"系統提示: {alert_message}",
-                                "title": "Alert Message",
-                                "has_content": True,
-                                "url": "alert://system-message",
-                                "content_length": len(alert_message),
-                                "is_alert": True,
-                                "alert_message": alert_message
-                            }
-                            
-                            if global_index < len(main_data):
-                                return {
-                                    **main_data[global_index],
-                                    "detail": {
-                                        "html": alert_html,
-                                        "structured": alert_structured,
-                                        "fetched": True,
-                                        "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
-                                        "retry_count": attempt
-                                    }
+                                
+                                alert_structured = {
+                                    "tables_count": 0,
+                                    "page_text": f"系統提示: {alert_message}",
+                                    "title": "Alert Message",
+                                    "has_content": True,
+                                    "url": "alert://system-message",
+                                    "content_length": len(alert_message),
+                                    "is_alert": True,
+                                    "alert_message": alert_message
                                 }
-                            else:
-                                return {
-                                    "index": global_index,
-                                    "date": "",
-                                    "time": "",
-                                    "code": "",
-                                    "company": "",
-                                    "subject": "",
-                                    "hasDetail": True,
-                                    "detail": {
-                                        "html": alert_html,
-                                        "structured": alert_structured,
-                                        "fetched": True,
-                                        "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
-                                        "retry_count": attempt
+                                
+                                if global_index < len(main_data):
+                                    return {
+                                        **main_data[global_index],
+                                        "detail": {
+                                            "html": alert_html,
+                                            "structured": alert_structured,
+                                            "fetched": True,
+                                            "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
+                                            "retry_count": attempt
+                                        }
                                     }
-                                }
-                        
-                        # 沒有 alert，正常處理新頁面
-                        detail_page = await page_task
+                                else:
+                                    return {
+                                        "index": global_index,
+                                        "date": "",
+                                        "time": "",
+                                        "code": "",
+                                        "company": "",
+                                        "subject": "",
+                                        "hasDetail": True,
+                                        "detail": {
+                                            "html": alert_html,
+                                            "structured": alert_structured,
+                                            "fetched": True,
+                                            "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
+                                            "retry_count": attempt
+                                        }
+                                    }
+                            
+                            # 沒有 alert，正常處理新頁面
+                            detail_page = await new_page_info.value
                     
                     finally:
                         # 移除 dialog 監聽器
