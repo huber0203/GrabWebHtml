@@ -344,7 +344,7 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
     semaphore = asyncio.Semaphore(max_concurrent)  # 限制同時開啟的頁面數
     
     async def _process_single_button(button, index):
-        """處理單個按鈕 - 含重試機制"""
+        """處理單個按鈕 - 含重試機制和 Alert 處理"""
         async with semaphore:
             detail_start = datetime.now()
             global_index = offset + index
@@ -352,6 +352,8 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
             
             for attempt in range(max_retries):
                 detail_page = None
+                alert_message = None
+                
                 try:
                     if global_index < len(main_data):
                         company_name = main_data[global_index].get('company', 'N/A')
@@ -360,62 +362,147 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                         else:
                             logger.info(f"    [{index+1}] 重試 {attempt} - {company_name}")
                     
-                    # 開啟新分頁
-                    async with context.expect_page(timeout=20000) as new_page_info:
-                        await button.click()
-                        detail_page = await new_page_info.value
+                    # 設定 alert 監聽器 - 在點擊前設定
+                    alert_handled = False
+                    
+                    def handle_dialog(dialog):
+                        nonlocal alert_message, alert_handled
+                        alert_message = dialog.message
+                        alert_handled = True
+                        logger.warning(f"    [{index+1}] 捕獲 Alert: {alert_message}")
+                        # 自動接受 dialog
+                        asyncio.create_task(dialog.accept())
+                    
+                    context.on("dialog", handle_dialog)
+                    
+                    try:
+                        # 開啟新分頁，但處理可能的 alert
+                        async with context.expect_page(timeout=20000) as new_page_info:
+                            await button.click()
+                            
+                            # 短暫等待，看是否有 alert 出現
+                            await asyncio.sleep(1)
+                            
+                            if alert_handled:
+                                # 如果有 alert，返回標準格式但在 structured 中記錄 alert
+                                logger.info(f"    [{index+1}] Alert 處理完成: {alert_message}")
+                                
+                                # 創建一個模擬的 HTML 內容，包含 alert 訊息
+                                alert_html = f"""<!DOCTYPE html>
+<html>
+<head><title>Alert Message</title></head>
+<body>
+<div class="alert-message">
+<h3>系統提示</h3>
+<p>{alert_message}</p>
+</div>
+</body>
+</html>"""
+                                
+                                alert_structured = {
+                                    "tables_count": 0,
+                                    "page_text": f"系統提示: {alert_message}",
+                                    "title": "Alert Message",
+                                    "has_content": True,
+                                    "url": "alert://system-message",
+                                    "content_length": len(alert_message),
+                                    "is_alert": True,
+                                    "alert_message": alert_message
+                                }
+                                
+                                if global_index < len(main_data):
+                                    return {
+                                        **main_data[global_index],
+                                        "detail": {
+                                            "html": alert_html,
+                                            "structured": alert_structured,
+                                            "fetched": True,  # 技術上我們確實"取得"了內容（alert）
+                                            "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
+                                            "retry_count": attempt
+                                        }
+                                    }
+                                else:
+                                    return {
+                                        "index": global_index,
+                                        "date": "",
+                                        "time": "",
+                                        "code": "",
+                                        "company": "",
+                                        "subject": "",
+                                        "hasDetail": True,
+                                        "detail": {
+                                            "html": alert_html,
+                                            "structured": alert_structured,
+                                            "fetched": True,
+                                            "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
+                                            "retry_count": attempt
+                                        }
+                                    }
+                            
+                            # 沒有 alert，正常處理新頁面
+                            detail_page = await new_page_info.value
+                    
+                    finally:
+                        # 移除 dialog 監聽器
+                        context.remove_listener("dialog", handle_dialog)
+                    
+                    # 如果已經處理了 alert，就不繼續了
+                    if alert_handled:
+                        break
                     
                     # 檢查頁面是否正常
-                    if detail_page.is_closed():
+                    if detail_page and detail_page.is_closed():
                         raise Exception("Page was closed immediately after opening")
                     
-                    # 等待載入
-                    await detail_page.wait_for_load_state("networkidle", timeout=25000)
-                    
-                    # 取得內容
-                    detail_content = await detail_page.content()
-                    
-                    # 解析結構化資料
-                    structured_detail = await detail_page.evaluate("""
-                        () => {
-                            const tables = Array.from(document.querySelectorAll('table'));
-                            const text_content = document.body.innerText;
-                            
-                            return {
-                                tables_count: tables.length,
-                                page_text: text_content.slice(0, 2000),
-                                title: document.title,
-                                has_content: text_content.length > 100,
-                                url: window.location.href,
-                                content_length: text_content.length
-                            };
-                        }
-                    """)
-                    
-                    await detail_page.close()
-                    detail_page = None
-                    
-                    fetch_time = (datetime.now() - detail_start).total_seconds()
-                    retry_suffix = f" (重試{attempt}次)" if attempt > 0 else ""
-                    logger.info(f"    [{index+1}] 完成，{fetch_time:.1f}秒，{len(detail_content)//1024}KB{retry_suffix}")
-                    
-                    if global_index < len(main_data):
-                        return {
-                            **main_data[global_index],
-                            "detail": {
-                                "html": detail_content,
-                                "structured": structured_detail,
-                                "fetched": True,
-                                "fetch_time_seconds": fetch_time,
-                                "retry_count": attempt
+                    if detail_page:
+                        # 等待載入
+                        await detail_page.wait_for_load_state("networkidle", timeout=25000)
+                        
+                        # 取得內容
+                        detail_content = await detail_page.content()
+                        
+                        # 解析結構化資料
+                        structured_detail = await detail_page.evaluate("""
+                            () => {
+                                const tables = Array.from(document.querySelectorAll('table'));
+                                const text_content = document.body.innerText;
+                                
+                                return {
+                                    tables_count: tables.length,
+                                    page_text: text_content.slice(0, 2000),
+                                    title: document.title,
+                                    has_content: text_content.length > 100,
+                                    url: window.location.href,
+                                    content_length: text_content.length
+                                };
                             }
-                        }
-                    else:
-                        return {
-                            "index": global_index,
-                            "error": "Index out of range",
-                            "detail": {"fetched": False, "error": "Index out of range", "retry_count": attempt}
-                        }
+                        """)
+                        
+                        await detail_page.close()
+                        detail_page = None
+                        
+                        fetch_time = (datetime.now() - detail_start).total_seconds()
+                        retry_suffix = f" (重試{attempt}次)" if attempt > 0 else ""
+                        logger.info(f"    [{index+1}] 完成，{fetch_time:.1f}秒，{len(detail_content)//1024}KB{retry_suffix}")
+                        
+                        if global_index < len(main_data):
+                            return {
+                                **main_data[global_index],
+                                "detail": {
+                                    "html": detail_content,
+                                    "structured": structured_detail,
+                                    "fetched": True,
+                                    "fetch_time_seconds": fetch_time,
+                                    "retry_count": attempt,
+                                    "is_alert": False
+                                }
+                            }
+                        else:
+                            return {
+                                "index": global_index,
+                                "error": "Index out of range",
+                                "detail": {"fetched": False, "error": "Index out of range", "retry_count": attempt}
+                            }
                     
                 except Exception as e:
                     error_msg = str(e)
@@ -427,6 +514,10 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                         except:
                             pass
                         detail_page = None
+                    
+                    # 如果是因為 alert 導致的錯誤，但我們已經處理了 alert，就不重試了
+                    if alert_handled:
+                        break
                     
                     # 判斷是否應該重試
                     should_retry = (
@@ -455,7 +546,8 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                                     "fetched": False,
                                     "fetch_time_seconds": fetch_time,
                                     "retry_count": attempt,
-                                    "final_failure": True
+                                    "final_failure": True,
+                                    "alert_message": alert_message if alert_message else None
                                 }
                             }
                         else:
@@ -466,7 +558,8 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                                     "fetched": False, 
                                     "error": error_msg, 
                                     "retry_count": attempt,
-                                    "final_failure": True
+                                    "final_failure": True,
+                                    "alert_message": alert_message if alert_message else None
                                 }
                             }
     
