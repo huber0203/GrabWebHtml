@@ -16,7 +16,7 @@ import logging
 import sys
 import asyncio
 
-app = FastAPI(title="Universal HTML Fetcher", version="1.4.0")
+app = FastAPI(title="Universal HTML Fetcher", version="1.4.1")
 
 # 設定日誌
 logging.basicConfig(
@@ -186,6 +186,13 @@ class RenderRequest(BaseModel):
     pretty_content: bool = False
 
 
+class FlexibleMopsRequest(BaseModel):
+    url: str
+    batch_size: int = 10
+    max_concurrent: int = 5
+    timeout_ms: int = 300000
+
+
 # --------------------
 # /fetch 端點：純 HTTP 抓取
 # --------------------
@@ -336,12 +343,90 @@ async def render(req: RenderRequest):
 
 
 # --------------------
+# MOPS 安全資料解析函數
+# --------------------
+async def get_main_data_safely(page):
+    """安全地獲取主表格資料，確保沒有 None 元素"""
+    
+    try:
+        main_data = await page.evaluate("""
+            () => {
+                const dataRows = document.querySelectorAll('table tbody tr');
+                const results = [];
+                
+                Array.from(dataRows).forEach((row, index) => {
+                    const cells = Array.from(row.cells);
+                    
+                    const hasViewButton = row.querySelector('button') && 
+                                         row.querySelector('button').textContent.includes('查看');
+                    
+                    if (cells.length >= 6 && hasViewButton) {
+                        // 確保所有字段都有預設值
+                        const record = {
+                            index: results.length,
+                            date: cells[0]?.querySelector('span')?.textContent?.trim() || cells[0]?.textContent?.trim() || '',
+                            time: cells[1]?.querySelector('span')?.textContent?.trim() || cells[1]?.textContent?.trim() || '',
+                            code: cells[2]?.querySelector('span')?.textContent?.trim() || cells[2]?.textContent?.trim() || '',
+                            company: cells[3]?.querySelector('span')?.textContent?.trim() || cells[3]?.textContent?.trim() || `Company_${results.length}`,
+                            subject: cells[4]?.querySelector('span')?.textContent?.trim() || cells[4]?.textContent?.trim() || '',
+                            hasDetail: hasViewButton,
+                            rowElement: index
+                        };
+                        
+                        results.push(record);
+                    }
+                });
+                
+                return results;
+            }
+        """)
+    except Exception as e:
+        logger.error(f"主資料解析失敗: {e}")
+        main_data = []
+    
+    # 再次檢查並過濾掉任何 None 或無效的記錄
+    filtered_data = []
+    for i, record in enumerate(main_data or []):
+        if record is not None and isinstance(record, dict):
+            # 確保必要的字段存在
+            if 'company' not in record or not record['company']:
+                record['company'] = f'Company_{i}'
+            if 'index' not in record:
+                record['index'] = i
+            filtered_data.append(record)
+        else:
+            # 創建預設記錄
+            filtered_data.append({
+                'index': i,
+                'date': '',
+                'time': '',
+                'code': '',
+                'company': f'Company_{i}',
+                'subject': '',
+                'hasDetail': True
+            })
+    
+    logger.info(f"安全解析完成 - 原始: {len(main_data or [])}, 過濾後: {len(filtered_data)}")
+    if filtered_data:
+        logger.info(f"前3筆資料預覽: {filtered_data[:3]}")
+    
+    return filtered_data
+
+
+# --------------------
 # MOPS 併發處理輔助函數
 # --------------------
 async def _process_batch_concurrent(context, buttons, main_data, offset, max_concurrent):
     """併發處理一批按鈕 - 含重試機制"""
     
-    semaphore = asyncio.Semaphore(max_concurrent)  # 限制同時開啟的頁面數
+    # 驗證輸入資料
+    if not main_data:
+        logger.error("main_data 為空，無法處理批次")
+        return []
+    
+    logger.info(f"批次處理 - 偏移: {offset}, 按鈕數: {len(buttons)}, 主資料數: {len(main_data)}")
+    
+    semaphore = asyncio.Semaphore(max_concurrent)
     
     async def _process_single_button(button, index):
         """處理單個按鈕 - 含重試機制和 Alert 處理"""
@@ -356,21 +441,41 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                 dialog_handler = None
                 
                 try:
-                    if global_index < len(main_data):
-                        company_name = main_data[global_index].get('company', 'N/A')
-                        if attempt == 0:
-                            logger.info(f"    [{index+1}] 處理 {company_name}")
-                        else:
-                            logger.info(f"    [{index+1}] 重試 {attempt} - {company_name}")
+                    # 安全獲取 main_data 中的資料
+                    current_record = None
+                    if global_index < len(main_data) and main_data[global_index] is not None:
+                        current_record = main_data[global_index]
+                        if not isinstance(current_record, dict):
+                            logger.warning(f"記錄 {global_index} 不是字典: {type(current_record)}")
+                            current_record = None
                     
-                    # 設定 alert 監聽器 - 在點擊前設定，使用同步標記避免重複處理
+                    if current_record is None:
+                        # 創建預設記錄
+                        current_record = {
+                            'index': global_index,
+                            'date': '',
+                            'time': '',
+                            'code': '',
+                            'company': f'Unknown_{global_index}',
+                            'subject': '',
+                            'hasDetail': True
+                        }
+                        logger.info(f"    [{index+1}] 使用預設記錄 {global_index}")
+                    
+                    company_name = current_record.get('company', 'N/A')
+                    if attempt == 0:
+                        logger.info(f"    [{index+1}] 處理 {company_name}")
+                    else:
+                        logger.info(f"    [{index+1}] 重試 {attempt} - {company_name}")
+                    
+                    # 設定 alert 監聽器
                     alert_handled = False
                     dialog_processed = False
                     
                     async def handle_dialog(dialog):
                         nonlocal alert_message, alert_handled, dialog_processed
                         if dialog_processed:
-                            return  # 已經處理過了，直接返回
+                            return
                         
                         dialog_processed = True
                         alert_message = dialog.message
@@ -378,7 +483,6 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                         logger.warning(f"    [{index+1}] 捕獲 Alert: {alert_message}")
                         
                         try:
-                            # 同步處理 dialog，不用 asyncio.create_task
                             await dialog.accept()
                         except Exception as e:
                             logger.warning(f"    [{index+1}] Dialog 已被處理: {e}")
@@ -395,10 +499,9 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                             await asyncio.sleep(1.5)
                             
                             if alert_handled:
-                                # 如果有 alert，直接返回 alert 資訊，不需要等待新頁面
+                                # 如果有 alert，直接返回 alert 資訊
                                 logger.info(f"    [{index+1}] Alert 處理完成: {alert_message}")
                                 
-                                # 創建一個模擬的 HTML 內容，包含 alert 訊息
                                 alert_html = f"""<!DOCTYPE html>
 <html>
 <head><title>Alert Message</title></head>
@@ -421,34 +524,16 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                                     "alert_message": alert_message
                                 }
                                 
-                                if global_index < len(main_data) and main_data[global_index]:
-                                    return {
-                                        **main_data[global_index],
-                                        "detail": {
-                                            "html": alert_html,
-                                            "structured": alert_structured,
-                                            "fetched": True,
-                                            "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
-                                            "retry_count": attempt
-                                        }
+                                return {
+                                    **current_record,
+                                    "detail": {
+                                        "html": alert_html,
+                                        "structured": alert_structured,
+                                        "fetched": True,
+                                        "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
+                                        "retry_count": attempt
                                     }
-                                else:
-                                    return {
-                                        "index": global_index,
-                                        "date": "",
-                                        "time": "",
-                                        "code": "",
-                                        "company": "",
-                                        "subject": "",
-                                        "hasDetail": True,
-                                        "detail": {
-                                            "html": alert_html,
-                                            "structured": alert_structured,
-                                            "fetched": True,
-                                            "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
-                                            "retry_count": attempt
-                                        }
-                                    }
+                                }
                             
                             # 沒有 alert，正常處理新頁面
                             detail_page = await new_page_info.value
@@ -500,34 +585,16 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                         retry_suffix = f" (重試{attempt}次)" if attempt > 0 else ""
                         logger.info(f"    [{index+1}] 完成，{fetch_time:.1f}秒，{len(detail_content)//1024}KB{retry_suffix}")
                         
-                        if global_index < len(main_data) and main_data[global_index]:
-                            return {
-                                **main_data[global_index],
-                                "detail": {
-                                    "html": detail_content,
-                                    "structured": structured_detail,
-                                    "fetched": True,
-                                    "fetch_time_seconds": fetch_time,
-                                    "retry_count": attempt
-                                }
+                        return {
+                            **current_record,
+                            "detail": {
+                                "html": detail_content,
+                                "structured": structured_detail,
+                                "fetched": True,
+                                "fetch_time_seconds": fetch_time,
+                                "retry_count": attempt
                             }
-                        else:
-                            return {
-                                "index": global_index,
-                                "date": "",
-                                "time": "",
-                                "code": "",
-                                "company": "",
-                                "subject": "",
-                                "hasDetail": False,
-                                "detail": {
-                                    "html": detail_content,
-                                    "structured": structured_detail,
-                                    "fetched": True,
-                                    "fetch_time_seconds": fetch_time,
-                                    "retry_count": attempt
-                                }
-                            }
+                        }
                     
                 except Exception as e:
                     error_msg = str(e)
@@ -561,7 +628,7 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                     )
                     
                     if should_retry:
-                        retry_delay = min(2 ** attempt, 5)  # 指數退避，最多5秒
+                        retry_delay = min(2 ** attempt, 5)
                         logger.warning(f"    [{index+1}] 重試 {attempt+1}/{max_retries}: {error_msg}")
                         await asyncio.sleep(retry_delay)
                         continue
@@ -570,30 +637,29 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                         fetch_time = (datetime.now() - detail_start).total_seconds()
                         logger.error(f"    [{index+1}] 最終失敗 (重試{attempt}次): {error_msg}")
                         
-                        if global_index < len(main_data):
-                            return {
-                                **main_data[global_index],
-                                "detail": {
-                                    "error": error_msg,
-                                    "fetched": False,
-                                    "fetch_time_seconds": fetch_time,
-                                    "retry_count": attempt,
-                                    "final_failure": True,
-                                    "alert_message": alert_message if alert_message else None
-                                }
+                        # 確保 current_record 存在
+                        if current_record is None:
+                            current_record = {
+                                'index': global_index,
+                                'date': '',
+                                'time': '',
+                                'code': '',
+                                'company': f'Unknown_{global_index}',
+                                'subject': '',
+                                'hasDetail': True
                             }
-                        else:
-                            return {
-                                "index": global_index,
+                        
+                        return {
+                            **current_record,
+                            "detail": {
                                 "error": error_msg,
-                                "detail": {
-                                    "fetched": False, 
-                                    "error": error_msg, 
-                                    "retry_count": attempt,
-                                    "final_failure": True,
-                                    "alert_message": alert_message if alert_message else None
-                                }
+                                "fetched": False,
+                                "fetch_time_seconds": fetch_time,
+                                "retry_count": attempt,
+                                "final_failure": True,
+                                "alert_message": alert_message if alert_message else None
                             }
+                        }
     
     # 併發處理所有按鈕
     tasks = [
@@ -609,21 +675,32 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
         if isinstance(result, Exception):
             logger.error(f"    批次項目 {i} 發生例外: {result}")
             global_index = offset + i
-            if global_index < len(main_data):
-                processed_results.append({
-                    **main_data[global_index],
-                    "detail": {
-                        "error": str(result),
-                        "fetched": False,
-                        "fetch_time_seconds": 0
-                    }
-                })
-            else:
-                processed_results.append({
-                    "index": global_index,
+            
+            # 安全獲取記錄
+            current_record = None
+            if global_index < len(main_data) and main_data[global_index] is not None:
+                current_record = main_data[global_index]
+            
+            if current_record is None or not isinstance(current_record, dict):
+                current_record = {
+                    'index': global_index,
+                    'date': '',
+                    'time': '',
+                    'code': '',
+                    'company': f'Exception_{global_index}',
+                    'subject': '',
+                    'hasDetail': True
+                }
+            
+            processed_results.append({
+                **current_record,
+                "detail": {
                     "error": str(result),
-                    "detail": {"fetched": False, "error": str(result)}
-                })
+                    "fetched": False,
+                    "fetch_time_seconds": 0,
+                    "exception_in_batch": True
+                }
+            })
         else:
             processed_results.append(result)
     
@@ -666,24 +743,7 @@ async def fetch_mops_complete(req: RenderRequest):
                 
                 # 取得主表格資料
                 logger.info("解析主表格資料...")
-                main_data = await page.evaluate("""
-                    () => {
-                        const rows = document.querySelectorAll('tr[data-v-d5176dd2]');
-                        return Array.from(rows).map((row, index) => {
-                            const cells = Array.from(row.cells);
-                            return {
-                                index: index,
-                                date: cells[0]?.querySelector('span')?.textContent?.trim(),
-                                time: cells[1]?.querySelector('span')?.textContent?.trim(),
-                                code: cells[2]?.querySelector('span')?.textContent?.trim(),
-                                company: cells[3]?.querySelector('span')?.textContent?.trim(),
-                                subject: cells[4]?.querySelector('span')?.textContent?.trim(),
-                                hasDetail: cells[5]?.querySelector('button') !== null
-                            };
-                        });
-                    }
-                """)
-                
+                main_data = await get_main_data_safely(page)
                 logger.info(f"主表格解析完成，找到 {len(main_data)} 筆記錄")
                 
                 # 為每筆資料取得詳細內容
@@ -820,8 +880,8 @@ async def fetch_mops_concurrent(req: RenderRequest):
     logger.info(f"開始 MOPS 併發抓取: {req.url}")
     
     # 併發設定
-    BATCH_SIZE = 10  # 每批處理數量
-    MAX_CONCURRENT = 5  # 最大同時開啟的詳細頁面數
+    BATCH_SIZE = 10
+    MAX_CONCURRENT = 5
     
     async def _concurrent_fetch():
         async with async_playwright() as p:
@@ -845,40 +905,9 @@ async def fetch_mops_concurrent(req: RenderRequest):
                 page_load_time = (datetime.now() - page_start).total_seconds()
                 logger.info(f"主頁面載入完成，耗時: {page_load_time:.2f}秒")
                 
-                # 取得主表格資料 - 使用更精確的選擇器
+                # 取得主表格資料
                 logger.info("解析主表格資料...")
-                main_data_and_buttons = await page.evaluate("""
-                    () => {
-                        /* 使用更精確的選擇器，只抓取實際的資料列 */
-                        const dataRows = document.querySelectorAll('table tbody tr');
-                        const results = [];
-                        
-                        Array.from(dataRows).forEach((row, index) => {
-                            const cells = Array.from(row.cells);
-                            
-                            /* 檢查是否為有效的資料列（必須有足夠的欄位且有查看按鈕） */
-                            const hasViewButton = row.querySelector('button') && 
-                                                 row.querySelector('button').textContent.includes('查看');
-                            
-                            if (cells.length >= 6 && hasViewButton) {
-                                results.push({
-                                    index: results.length, /* 使用有效資料的索引 */
-                                    date: cells[0]?.querySelector('span')?.textContent?.trim() || cells[0]?.textContent?.trim(),
-                                    time: cells[1]?.querySelector('span')?.textContent?.trim() || cells[1]?.textContent?.trim(),
-                                    code: cells[2]?.querySelector('span')?.textContent?.trim() || cells[2]?.textContent?.trim(),
-                                    company: cells[3]?.querySelector('span')?.textContent?.trim() || cells[3]?.textContent?.trim(),
-                                    subject: cells[4]?.querySelector('span')?.textContent?.trim() || cells[4]?.textContent?.trim(),
-                                    hasDetail: hasViewButton,
-                                    rowElement: index /* 保存原始索引以便後續匹配 */
-                                });
-                            }
-                        });
-                        
-                        return results;
-                    }
-                """)
-                
-                main_data = main_data_and_buttons  # 保持向後兼容
+                main_data = await get_main_data_safely(page)
                 logger.info(f"主表格解析完成，找到 {len(main_data)} 筆有效記錄")
                 
                 # 只從有資料的列中找查看按鈕
@@ -887,7 +916,7 @@ async def fetch_mops_concurrent(req: RenderRequest):
                 
                 # 估算總時間（併發版本）
                 estimated_batches = (len(view_buttons) + BATCH_SIZE - 1) // BATCH_SIZE
-                estimated_time = estimated_batches * 3  # 每批約3秒
+                estimated_time = estimated_batches * 3
                 logger.info(f"將分 {estimated_batches} 批處理，預估總時間: {estimated_time//60}分{estimated_time%60}秒")
                 
                 all_results = []
@@ -952,7 +981,7 @@ async def fetch_mops_concurrent(req: RenderRequest):
             "data": results,
             "timestamp": datetime.now().isoformat(),
             "method": "concurrent",
-            "batch_size": 10
+            "batch_size": BATCH_SIZE
         }
     except Exception as e:
         total_time = (datetime.now() - start_time).total_seconds()
@@ -960,24 +989,12 @@ async def fetch_mops_concurrent(req: RenderRequest):
         raise HTTPException(status_code=502, detail=f"Concurrent fetch failed: {e}")
 
 
-class FlexibleMopsRequest(BaseModel):
-    url: str
-    batch_size: int = 10
-    max_concurrent: int = 5
-    timeout_ms: int = 300000
-
 @app.post("/mops-flexible")
 async def fetch_mops_flexible(req: FlexibleMopsRequest):
     """靈活配置的 MOPS 抓取"""
     
-    render_req = RenderRequest(
-        url=req.url,
-        timeout_ms=req.timeout_ms
-    )
-    
     logger.info(f"靈活抓取設定 - 批次大小: {req.batch_size}, 最大併發: {req.max_concurrent}")
     
-    # 使用類似 mops-concurrent 的邏輯，但使用傳入的參數
     start_time = datetime.now()
     
     async def _flexible_fetch():
@@ -988,47 +1005,18 @@ async def fetch_mops_flexible(req: FlexibleMopsRequest):
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-web-security"]
             )
             context = await browser.new_context(
-                user_agent=render_req.user_agent,
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080},
             )
             page = await context.new_page()
             
             try:
                 # 載入主頁面
-                await page.goto(str(render_req.url), wait_until="networkidle", timeout=60000)
+                await page.goto(str(req.url), wait_until="networkidle", timeout=60000)
                 await page.wait_for_selector("table", timeout=30000)
                 
                 # 取得主表格資料
-                main_data = await page.evaluate("""
-                    () => {
-                        /* 使用更精確的選擇器，只抓取實際的資料列 */
-                        const dataRows = document.querySelectorAll('table tbody tr');
-                        const results = [];
-                        
-                        Array.from(dataRows).forEach((row, index) => {
-                            const cells = Array.from(row.cells);
-                            
-                            /* 檢查是否為有效的資料列（必須有足夠的欄位且有查看按鈕） */
-                            const hasViewButton = row.querySelector('button') && 
-                                                 row.querySelector('button').textContent.includes('查看');
-                            
-                            if (cells.length >= 6 && hasViewButton) {
-                                results.push({
-                                    index: results.length, /* 使用有效資料的索引 */
-                                    date: cells[0]?.querySelector('span')?.textContent?.trim() || cells[0]?.textContent?.trim(),
-                                    time: cells[1]?.querySelector('span')?.textContent?.trim() || cells[1]?.textContent?.trim(),
-                                    code: cells[2]?.querySelector('span')?.textContent?.trim() || cells[2]?.textContent?.trim(),
-                                    company: cells[3]?.querySelector('span')?.textContent?.trim() || cells[3]?.textContent?.trim(),
-                                    subject: cells[4]?.querySelector('span')?.textContent?.trim() || cells[4]?.textContent?.trim(),
-                                    hasDetail: hasViewButton
-                                });
-                            }
-                        });
-                        
-                        return results;
-                    }
-                """)
-                
+                main_data = await get_main_data_safely(page)
                 logger.info(f"找到 {len(main_data)} 筆記錄")
                 
                 view_buttons = await page.query_selector_all('table tbody tr button:has-text("查看")')
@@ -1100,7 +1088,7 @@ async def fetch_mops_quick_test(req: RenderRequest):
                 logger.info("頁面載入完成")
                 
                 view_buttons = await page.query_selector_all('button:has-text("查看")')
-                test_count = min(3, len(view_buttons))  # 只測試前3個
+                test_count = min(3, len(view_buttons))
                 logger.info(f"找到 {len(view_buttons)} 個按鈕，測試前 {test_count} 個")
                 
                 results = []
@@ -1197,7 +1185,7 @@ async def analyze_mops_buttons(req: RenderRequest):
 # --------------------
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "version": "1.4.0"}
+    return {"ok": True, "version": "1.4.1"}
 
 
 # --------------------
