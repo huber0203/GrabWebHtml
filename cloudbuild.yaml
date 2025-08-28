@@ -25,11 +25,11 @@ steps:
       '--region', 'asia-east1',
       '--platform', 'managed',
       '--allow-unauthenticated',
-      '--memory', '2Gi',
-      '--cpu', '2',
-      '--timeout', '300',
+      '--memory', '4Gi',
+      '--cpu', '4',
+      '--timeout', '900',
       '--concurrency', '10',
-      '--max-instances', '10'
+      '--max-instances', '3'
     ]
 
 # 映像將被推送到 Container Registry
