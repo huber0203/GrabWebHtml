@@ -491,19 +491,45 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                     context.on("dialog", dialog_handler)
                     
                     try:
-                        # 開啟新分頁，但處理可能的 alert
-                        async with context.expect_page(timeout=20000) as new_page_info:
-                            await button.click()
+                        # 點擊按鈕
+                        await button.click()
+                        
+                        # 等待短暫時間看是否有 Alert
+                        await asyncio.sleep(2)
+                        
+                        if alert_handled:
+                            # 如果有 alert，直接返回 alert 資訊
+                            logger.info(f"    [{index+1}] Alert 處理完成: {alert_message}")
                             
-                            # 短暫等待，看是否有 alert 出現
-                            await asyncio.sleep(1.5)
+                            safe_alert_message = alert_message or "系統提示：無法取得詳細資料"
                             
+                            return {
+                                **current_record,
+                                "detail": {
+                                    "html": "<html><body>Alert</body></html>",
+                                    "structured": {
+                                        "tables_count": 0,
+                                        "page_text": safe_alert_message,
+                                        "title": "",
+                                        "has_content": True,
+                                        "url": "about:blank",
+                                        "content_length": len(safe_alert_message)
+                                    },
+                                    "fetched": True,
+                                    "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
+                                    "retry_count": attempt
+                                }
+                            }
+                        
+                        # 沒有 alert，等待新頁面
+                        try:
+                            async with context.expect_page(timeout=15000) as new_page_info:
+                                detail_page = await new_page_info.value
+                        except Exception:
+                            # 如果等待新頁面失敗，可能是延遲的 Alert
+                            await asyncio.sleep(1)
                             if alert_handled:
-                                # 如果有 alert，直接返回 alert 資訊
-                                logger.info(f"    [{index+1}] Alert 處理完成: {alert_message}")
-                                
                                 safe_alert_message = alert_message or "系統提示：無法取得詳細資料"
-                                
                                 return {
                                     **current_record,
                                     "detail": {
@@ -521,9 +547,7 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                                         "retry_count": attempt
                                     }
                                 }
-                            
-                            # 沒有 alert，正常處理新頁面
-                            detail_page = await new_page_info.value
+                            raise
                     
                     finally:
                         # 移除 dialog 監聽器
