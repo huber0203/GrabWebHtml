@@ -776,21 +776,22 @@ async def fetch_mops_concurrent(req: RenderRequest):
         raise HTTPException(status_code=502, detail=f"Concurrent fetch failed: {e}")
 
 
-@app.post("/mops-flexible")
-async def fetch_mops_flexible(
-    url: str,
-    batch_size: int = 10,
-    max_concurrent: int = 5,
+class FlexibleMopsRequest(BaseModel):
+    url: str
+    batch_size: int = 10
+    max_concurrent: int = 5
     timeout_ms: int = 300000
-):
+
+@app.post("/mops-flexible")
+async def fetch_mops_flexible(req: FlexibleMopsRequest):
     """靈活配置的 MOPS 抓取"""
     
-    req = RenderRequest(
-        url=url,
-        timeout_ms=timeout_ms
+    render_req = RenderRequest(
+        url=req.url,
+        timeout_ms=req.timeout_ms
     )
     
-    logger.info(f"靈活抓取設定 - 批次大小: {batch_size}, 最大併發: {max_concurrent}")
+    logger.info(f"靈活抓取設定 - 批次大小: {req.batch_size}, 最大併發: {req.max_concurrent}")
     
     # 使用類似 mops-concurrent 的邏輯，但使用傳入的參數
     start_time = datetime.now()
@@ -803,14 +804,14 @@ async def fetch_mops_flexible(
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-web-security"]
             )
             context = await browser.new_context(
-                user_agent=req.user_agent,
+                user_agent=render_req.user_agent,
                 viewport={"width": 1920, "height": 1080},
             )
             page = await context.new_page()
             
             try:
                 # 載入主頁面
-                await page.goto(str(req.url), wait_until="networkidle", timeout=60000)
+                await page.goto(str(render_req.url), wait_until="networkidle", timeout=60000)
                 await page.wait_for_selector("table", timeout=30000)
                 
                 # 取得主表格資料
@@ -840,16 +841,16 @@ async def fetch_mops_flexible(
                 all_results = []
                 
                 # 分批併發處理
-                for batch_start in range(0, len(view_buttons), batch_size):
-                    batch_end = min(batch_start + batch_size, len(view_buttons))
+                for batch_start in range(0, len(view_buttons), req.batch_size):
+                    batch_end = min(batch_start + req.batch_size, len(view_buttons))
                     batch_buttons = view_buttons[batch_start:batch_end]
-                    batch_num = batch_start // batch_size + 1
-                    total_batches = (len(view_buttons) + batch_size - 1) // batch_size
+                    batch_num = batch_start // req.batch_size + 1
+                    total_batches = (len(view_buttons) + req.batch_size - 1) // req.batch_size
                     
                     logger.info(f"處理第 {batch_num}/{total_batches} 批")
                     
                     batch_results = await _process_batch_concurrent(
-                        context, batch_buttons, main_data, batch_start, max_concurrent
+                        context, batch_buttons, main_data, batch_start, req.max_concurrent
                     )
                     
                     all_results.extend(batch_results)
@@ -877,8 +878,8 @@ async def fetch_mops_flexible(
             "data": results,
             "timestamp": datetime.now().isoformat(),
             "method": "flexible",
-            "batch_size": batch_size,
-            "max_concurrent": max_concurrent
+            "batch_size": req.batch_size,
+            "max_concurrent": req.max_concurrent
         }
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Flexible fetch failed: {e}")
