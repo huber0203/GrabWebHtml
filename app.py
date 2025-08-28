@@ -14,8 +14,9 @@ from bs4 import BeautifulSoup
 import re
 import logging
 import sys
+import asyncio
 
-app = FastAPI(title="Universal HTML Fetcher", version="1.3.0")
+app = FastAPI(title="Universal HTML Fetcher", version="1.4.0")
 
 # 設定日誌
 logging.basicConfig(
@@ -335,7 +336,132 @@ async def render(req: RenderRequest):
 
 
 # --------------------
-# MOPS 專用端點（含詳細日誌）
+# MOPS 併發處理輔助函數
+# --------------------
+async def _process_batch_concurrent(context, buttons, main_data, offset, max_concurrent):
+    """併發處理一批按鈕"""
+    
+    semaphore = asyncio.Semaphore(max_concurrent)  # 限制同時開啟的頁面數
+    
+    async def _process_single_button(button, index):
+        """處理單個按鈕"""
+        async with semaphore:
+            detail_start = datetime.now()
+            global_index = offset + index
+            
+            try:
+                if global_index < len(main_data):
+                    company_name = main_data[global_index].get('company', 'N/A')
+                    logger.info(f"    [{index+1}] 處理 {company_name}")
+                
+                # 開啟新分頁
+                async with context.expect_page() as new_page_info:
+                    await button.click()
+                    detail_page = await new_page_info.value
+                
+                # 等待載入
+                await detail_page.wait_for_load_state("networkidle", timeout=25000)
+                
+                # 取得內容
+                detail_content = await detail_page.content()
+                
+                # 解析結構化資料
+                structured_detail = await detail_page.evaluate("""
+                    () => {
+                        const tables = Array.from(document.querySelectorAll('table'));
+                        const text_content = document.body.innerText;
+                        
+                        return {
+                            tables_count: tables.length,
+                            page_text: text_content.slice(0, 2000),
+                            title: document.title,
+                            has_content: text_content.length > 100,
+                            url: window.location.href,
+                            content_length: text_content.length
+                        };
+                    }
+                """)
+                
+                await detail_page.close()
+                
+                fetch_time = (datetime.now() - detail_start).total_seconds()
+                logger.info(f"    [{index+1}] 完成，{fetch_time:.1f}秒，{len(detail_content)//1024}KB")
+                
+                if global_index < len(main_data):
+                    return {
+                        **main_data[global_index],
+                        "detail": {
+                            "html": detail_content,
+                            "structured": structured_detail,
+                            "fetched": True,
+                            "fetch_time_seconds": fetch_time
+                        }
+                    }
+                else:
+                    return {
+                        "index": global_index,
+                        "error": "Index out of range",
+                        "detail": {"fetched": False, "error": "Index out of range"}
+                    }
+                
+            except Exception as e:
+                error_msg = str(e)
+                fetch_time = (datetime.now() - detail_start).total_seconds()
+                logger.error(f"    [{index+1}] 錯誤: {error_msg}")
+                
+                if global_index < len(main_data):
+                    return {
+                        **main_data[global_index],
+                        "detail": {
+                            "error": error_msg,
+                            "fetched": False,
+                            "fetch_time_seconds": fetch_time
+                        }
+                    }
+                else:
+                    return {
+                        "index": global_index,
+                        "error": error_msg,
+                        "detail": {"fetched": False, "error": error_msg}
+                    }
+    
+    # 併發處理所有按鈕
+    tasks = [
+        _process_single_button(button, i) 
+        for i, button in enumerate(buttons)
+    ]
+    
+    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # 處理例外情況
+    processed_results = []
+    for i, result in enumerate(batch_results):
+        if isinstance(result, Exception):
+            logger.error(f"    批次項目 {i} 發生例外: {result}")
+            global_index = offset + i
+            if global_index < len(main_data):
+                processed_results.append({
+                    **main_data[global_index],
+                    "detail": {
+                        "error": str(result),
+                        "fetched": False,
+                        "fetch_time_seconds": 0
+                    }
+                })
+            else:
+                processed_results.append({
+                    "index": global_index,
+                    "error": str(result),
+                    "detail": {"fetched": False, "error": str(result)}
+                })
+        else:
+            processed_results.append(result)
+    
+    return processed_results
+
+
+# --------------------
+# MOPS 專用端點
 # --------------------
 @app.post("/mops-complete")
 async def fetch_mops_complete(req: RenderRequest):
@@ -373,7 +499,6 @@ async def fetch_mops_complete(req: RenderRequest):
                 main_data = await page.evaluate("""
                     () => {
                         const rows = document.querySelectorAll('tr[data-v-d5176dd2]');
-                        console.log(`找到 ${rows.length} 個資料列`);
                         return Array.from(rows).map((row, index) => {
                             const cells = Array.from(row.cells);
                             return {
@@ -517,6 +642,248 @@ async def fetch_mops_complete(req: RenderRequest):
         raise HTTPException(status_code=502, detail=f"Complete fetch failed: {e}")
 
 
+@app.post("/mops-concurrent")
+async def fetch_mops_concurrent(req: RenderRequest):
+    """併發版 MOPS 抓取：10個一組並行處理"""
+    
+    start_time = datetime.now()
+    logger.info(f"開始 MOPS 併發抓取: {req.url}")
+    
+    # 併發設定
+    BATCH_SIZE = 10  # 每批處理數量
+    MAX_CONCURRENT = 5  # 最大同時開啟的詳細頁面數
+    
+    async def _concurrent_fetch():
+        async with async_playwright() as p:
+            logger.info("啟動瀏覽器...")
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-web-security"]
+            )
+            context = await browser.new_context(
+                user_agent=req.user_agent,
+                viewport={"width": 1920, "height": 1080},
+            )
+            page = await context.new_page()
+            
+            try:
+                # 載入主頁面
+                logger.info("載入主頁面...")
+                page_start = datetime.now()
+                await page.goto(str(req.url), wait_until="networkidle", timeout=60000)
+                await page.wait_for_selector("table", timeout=30000)
+                page_load_time = (datetime.now() - page_start).total_seconds()
+                logger.info(f"主頁面載入完成，耗時: {page_load_time:.2f}秒")
+                
+                # 取得主表格資料
+                logger.info("解析主表格資料...")
+                main_data = await page.evaluate("""
+                    () => {
+                        const rows = document.querySelectorAll('tr[data-v-d5176dd2]');
+                        return Array.from(rows).map((row, index) => {
+                            const cells = Array.from(row.cells);
+                            return {
+                                index: index,
+                                date: cells[0]?.querySelector('span')?.textContent?.trim(),
+                                time: cells[1]?.querySelector('span')?.textContent?.trim(),
+                                code: cells[2]?.querySelector('span')?.textContent?.trim(),
+                                company: cells[3]?.querySelector('span')?.textContent?.trim(),
+                                subject: cells[4]?.querySelector('span')?.textContent?.trim(),
+                                hasDetail: cells[5]?.querySelector('button') !== null
+                            };
+                        });
+                    }
+                """)
+                
+                logger.info(f"主表格解析完成，找到 {len(main_data)} 筆記錄")
+                
+                # 取得所有查看按鈕
+                view_buttons = await page.query_selector_all('button:has-text("查看")')
+                logger.info(f"找到 {len(view_buttons)} 個查看按鈕")
+                
+                # 估算總時間（併發版本）
+                estimated_batches = (len(view_buttons) + BATCH_SIZE - 1) // BATCH_SIZE
+                estimated_time = estimated_batches * 3  # 每批約3秒
+                logger.info(f"將分 {estimated_batches} 批處理，預估總時間: {estimated_time//60}分{estimated_time%60}秒")
+                
+                all_results = []
+                
+                # 分批併發處理
+                for batch_start in range(0, len(view_buttons), BATCH_SIZE):
+                    batch_end = min(batch_start + BATCH_SIZE, len(view_buttons))
+                    batch_buttons = view_buttons[batch_start:batch_end]
+                    batch_num = batch_start // BATCH_SIZE + 1
+                    total_batches = (len(view_buttons) + BATCH_SIZE - 1) // BATCH_SIZE
+                    
+                    logger.info(f"處理第 {batch_num}/{total_batches} 批 ({len(batch_buttons)} 個項目)")
+                    batch_start_time = datetime.now()
+                    
+                    # 併發處理這一批
+                    batch_results = await _process_batch_concurrent(
+                        context, batch_buttons, main_data, batch_start, MAX_CONCURRENT
+                    )
+                    
+                    all_results.extend(batch_results)
+                    
+                    batch_time = (datetime.now() - batch_start_time).total_seconds()
+                    remaining_batches = total_batches - batch_num
+                    eta = remaining_batches * batch_time
+                    
+                    success_in_batch = sum(1 for r in batch_results if r.get('detail', {}).get('fetched', False))
+                    logger.info(f"批次完成 - 成功: {success_in_batch}/{len(batch_results)}, 耗時: {batch_time:.1f}秒, 預估剩餘: {eta//60:.0f}分{eta%60:.0f}秒")
+                    
+                    # 批次間短暫休息
+                    if batch_num < total_batches:
+                        await asyncio.sleep(1)
+                
+                total_time = (datetime.now() - start_time).total_seconds()
+                logger.info(f"所有詳細頁面處理完成！總耗時: {total_time//60:.0f}分{total_time%60:.1f}秒")
+                
+                return all_results
+                
+            finally:
+                logger.info("關閉瀏覽器...")
+                await context.close()
+                await browser.close()
+    
+    try:
+        results = await _concurrent_fetch()
+        
+        # 統計結果
+        success_count = sum(1 for r in results if r.get('detail', {}).get('fetched', False))
+        total_time = (datetime.now() - start_time).total_seconds()
+        
+        logger.info(f"併發抓取完成統計:")
+        logger.info(f"  成功: {success_count}/{len(results)} 筆")
+        logger.info(f"  總耗時: {total_time//60:.0f}分{total_time%60:.1f}秒")
+        logger.info(f"  平均每筆: {total_time/len(results):.2f}秒" if results else "  無資料")
+        
+        return {
+            "success": True,
+            "total_records": len(results),
+            "successful_details": success_count,
+            "failed_details": len(results) - success_count,
+            "total_time_seconds": total_time,
+            "average_time_per_record": total_time / len(results) if results else 0,
+            "data": results,
+            "timestamp": datetime.now().isoformat(),
+            "method": "concurrent",
+            "batch_size": 10
+        }
+    except Exception as e:
+        total_time = (datetime.now() - start_time).total_seconds()
+        logger.error(f"併發抓取失敗: {str(e)}，耗時: {total_time:.1f}秒")
+        raise HTTPException(status_code=502, detail=f"Concurrent fetch failed: {e}")
+
+
+@app.post("/mops-flexible")
+async def fetch_mops_flexible(
+    url: str,
+    batch_size: int = 10,
+    max_concurrent: int = 5,
+    timeout_ms: int = 300000
+):
+    """靈活配置的 MOPS 抓取"""
+    
+    req = RenderRequest(
+        url=url,
+        timeout_ms=timeout_ms
+    )
+    
+    logger.info(f"靈活抓取設定 - 批次大小: {batch_size}, 最大併發: {max_concurrent}")
+    
+    # 使用類似 mops-concurrent 的邏輯，但使用傳入的參數
+    start_time = datetime.now()
+    
+    async def _flexible_fetch():
+        async with async_playwright() as p:
+            logger.info("啟動瀏覽器...")
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-web-security"]
+            )
+            context = await browser.new_context(
+                user_agent=req.user_agent,
+                viewport={"width": 1920, "height": 1080},
+            )
+            page = await context.new_page()
+            
+            try:
+                # 載入主頁面
+                await page.goto(str(req.url), wait_until="networkidle", timeout=60000)
+                await page.wait_for_selector("table", timeout=30000)
+                
+                # 取得主表格資料
+                main_data = await page.evaluate("""
+                    () => {
+                        const rows = document.querySelectorAll('tr[data-v-d5176dd2]');
+                        return Array.from(rows).map((row, index) => {
+                            const cells = Array.from(row.cells);
+                            return {
+                                index: index,
+                                date: cells[0]?.querySelector('span')?.textContent?.trim(),
+                                time: cells[1]?.querySelector('span')?.textContent?.trim(),
+                                code: cells[2]?.querySelector('span')?.textContent?.trim(),
+                                company: cells[3]?.querySelector('span')?.textContent?.trim(),
+                                subject: cells[4]?.querySelector('span')?.textContent?.trim(),
+                                hasDetail: cells[5]?.querySelector('button') !== null
+                            };
+                        });
+                    }
+                """)
+                
+                logger.info(f"找到 {len(main_data)} 筆記錄")
+                
+                view_buttons = await page.query_selector_all('button:has-text("查看")')
+                logger.info(f"找到 {len(view_buttons)} 個查看按鈕")
+                
+                all_results = []
+                
+                # 分批併發處理
+                for batch_start in range(0, len(view_buttons), batch_size):
+                    batch_end = min(batch_start + batch_size, len(view_buttons))
+                    batch_buttons = view_buttons[batch_start:batch_end]
+                    batch_num = batch_start // batch_size + 1
+                    total_batches = (len(view_buttons) + batch_size - 1) // batch_size
+                    
+                    logger.info(f"處理第 {batch_num}/{total_batches} 批")
+                    
+                    batch_results = await _process_batch_concurrent(
+                        context, batch_buttons, main_data, batch_start, max_concurrent
+                    )
+                    
+                    all_results.extend(batch_results)
+                    
+                    if batch_num < total_batches:
+                        await asyncio.sleep(1)
+                
+                return all_results
+                
+            finally:
+                await context.close()
+                await browser.close()
+    
+    try:
+        results = await _flexible_fetch()
+        success_count = sum(1 for r in results if r.get('detail', {}).get('fetched', False))
+        total_time = (datetime.now() - start_time).total_seconds()
+        
+        return {
+            "success": True,
+            "total_records": len(results),
+            "successful_details": success_count,
+            "failed_details": len(results) - success_count,
+            "total_time_seconds": total_time,
+            "data": results,
+            "timestamp": datetime.now().isoformat(),
+            "method": "flexible",
+            "batch_size": batch_size,
+            "max_concurrent": max_concurrent
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Flexible fetch failed: {e}")
+
+
 @app.post("/mops-quick-test")
 async def fetch_mops_quick_test(req: RenderRequest):
     """快速測試版本：只抓取前3筆詳細資料"""
@@ -633,7 +1000,7 @@ async def analyze_mops_buttons(req: RenderRequest):
 # --------------------
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "version": "1.3.0"}
+    return {"ok": True, "version": "1.4.0"}
 
 
 # --------------------
