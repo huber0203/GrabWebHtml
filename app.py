@@ -417,9 +417,8 @@ async def get_main_data_safely(page):
 # MOPS 併發處理輔助函數
 # --------------------
 async def _process_batch_concurrent(context, buttons, main_data, offset, max_concurrent):
-    """併發處理一批按鈕 - 含重試機制"""
+    """併發處理一批按鈕 - Alert 立即返回，網頁失敗才重試"""
     
-    # 驗證輸入資料
     if not main_data:
         logger.error("main_data 為空，無法處理批次")
         return []
@@ -428,269 +427,12 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
     
     semaphore = asyncio.Semaphore(max_concurrent)
     
-    async def _process_single_button(button, index):
-        """處理單個按鈕 - 含重試機制和 Alert 處理"""
+    async def _process_single_button_safe(button, index):
+        """安全處理單個按鈕 - Alert 不重試，網頁失敗才重試"""
         async with semaphore:
-            detail_start = datetime.now()
             global_index = offset + index
-            max_retries = 10
             
-            for attempt in range(max_retries):
-                detail_page = None
-                alert_message = None
-                dialog_handler = None
-                
-                try:
-                    # 安全獲取 main_data 中的資料
-                    current_record = None
-                    if global_index < len(main_data) and main_data[global_index] is not None:
-                        current_record = main_data[global_index]
-                        if not isinstance(current_record, dict):
-                            logger.warning(f"記錄 {global_index} 不是字典: {type(current_record)}")
-                            current_record = None
-                    
-                    if current_record is None:
-                        # 創建預設記錄
-                        current_record = {
-                            'index': global_index,
-                            'date': '',
-                            'time': '',
-                            'code': '',
-                            'company': f'Unknown_{global_index}',
-                            'subject': '',
-                            'hasDetail': True
-                        }
-                        logger.info(f"    [{index+1}] 使用預設記錄 {global_index}")
-                    
-                    company_name = current_record.get('company', 'N/A')
-                    data_date = current_record.get('date', 'N/A')
-                    if attempt == 0:
-                        logger.info(f"    [{index+1}] 處理 {company_name} ({data_date})")
-                    else:
-                        logger.info(f"    [{index+1}] 重試 {attempt} - {company_name} ({data_date})")
-                    
-                    # 設定 alert 監聽器
-                    alert_handled = False
-                    dialog_processed = False
-                    
-                    async def handle_dialog(dialog):
-                        nonlocal alert_message, alert_handled, dialog_processed
-                        if dialog_processed:
-                            return
-                        
-                        dialog_processed = True
-                        alert_message = dialog.message or "系統Alert訊息"
-                        alert_handled = True
-                        logger.warning(f"    [{index+1}] 捕獲 Alert: {alert_message}")
-                        
-                        try:
-                            await dialog.accept()
-                        except Exception as e:
-                            logger.warning(f"    [{index+1}] Dialog 已被處理: {e}")
-                    
-                    dialog_handler = handle_dialog
-                    context.on("dialog", dialog_handler)
-                    
-                    try:
-                        # 先嘗試正常流程：點擊並等待新頁面
-                        detail_page = None
-                        try:
-                            async with context.expect_page(timeout=20000) as new_page_info:
-                                await button.click()
-                                # 等待一下看是否有 Alert
-                                await asyncio.sleep(1)
-                                if alert_handled:
-                                    # 如果有 Alert，直接跳出
-                                    break
-                                detail_page = await new_page_info.value
-                        except Exception as e:
-                            # 如果等待新頁面失敗，檢查是否因為 Alert
-                            if alert_handled:
-                                logger.info(f"    [{index+1}] Alert 處理完成: {alert_message}")
-                                safe_alert_message = alert_message or "系統提示：無法取得詳細資料"
-                                return {
-                                    **current_record,
-                                    "detail": {
-                                        "html": "<html><body>Alert</body></html>",
-                                        "structured": {
-                                            "tables_count": 0,
-                                            "page_text": safe_alert_message,
-                                            "title": "",
-                                            "has_content": True,
-                                            "url": "about:blank",
-                                            "content_length": len(safe_alert_message)
-                                        },
-                                        "fetched": True,
-                                        "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
-                                        "retry_count": attempt
-                                    }
-                                }
-                            else:
-                                # 沒有 Alert，就是真的失敗了
-                                raise e
-                        
-                        # 如果已經處理了 Alert，直接返回
-                        if alert_handled:
-                            logger.info(f"    [{index+1}] Alert 處理完成: {alert_message}")
-                            safe_alert_message = alert_message or "系統提示：無法取得詳細資料"
-                            return {
-                                **current_record,
-                                "detail": {
-                                    "html": "<html><body>Alert</body></html>",
-                                    "structured": {
-                                        "tables_count": 0,
-                                        "page_text": safe_alert_message,
-                                        "title": "",
-                                        "has_content": True,
-                                        "url": "about:blank",
-                                        "content_length": len(safe_alert_message)
-                                    },
-                                    "fetched": True,
-                                    "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
-                                    "retry_count": attempt
-                                }
-                            }
-                    
-                    finally:
-                        # 移除 dialog 監聽器
-                        if dialog_handler:
-                            try:
-                                context.remove_listener("dialog", dialog_handler)
-                            except:
-                                pass
-                    
-                    # 如果已經處理了 alert，就不繼續了
-                    if alert_handled:
-                        break
-                    
-                    # 檢查頁面是否正常
-                    if detail_page and detail_page.is_closed():
-                        raise Exception("Page was closed immediately after opening")
-                    
-                    if detail_page:
-                        # 等待載入
-                        await detail_page.wait_for_load_state("networkidle", timeout=25000)
-                        
-                        # 取得內容
-                        detail_content = await detail_page.content()
-                        
-                        # 解析結構化資料
-                        structured_detail = await detail_page.evaluate("""
-                            () => {
-                                const tables = Array.from(document.querySelectorAll('table'));
-                                const text_content = document.body.innerText;
-                                
-                                return {
-                                    tables_count: tables.length,
-                                    page_text: text_content.slice(0, 2000),
-                                    title: document.title,
-                                    has_content: text_content.length > 100,
-                                    url: window.location.href,
-                                    content_length: text_content.length
-                                };
-                            }
-                        """)
-                        
-                        await detail_page.close()
-                        detail_page = None
-                        
-                        fetch_time = (datetime.now() - detail_start).total_seconds()
-                        retry_suffix = f" (重試{attempt}次)" if attempt > 0 else ""
-                        logger.info(f"    [{index+1}] 完成，{fetch_time:.1f}秒，{len(detail_content)//1024}KB{retry_suffix}")
-                        
-                        return {
-                            **current_record,
-                            "detail": {
-                                "html": detail_content,
-                                "structured": structured_detail,
-                                "fetched": True,
-                                "fetch_time_seconds": fetch_time,
-                                "retry_count": attempt
-                            }
-                        }
-                    
-                except Exception as e:
-                    error_msg = str(e)
-                    
-                    # 確保頁面被關閉
-                    if detail_page and not detail_page.is_closed():
-                        try:
-                            await detail_page.close()
-                        except:
-                            pass
-                        detail_page = None
-                    
-                    # 移除 dialog 監聽器
-                    if dialog_handler:
-                        try:
-                            context.remove_listener("dialog", dialog_handler)
-                        except:
-                            pass
-                    
-                    # 如果是因為 alert 導致的錯誤，但我們已經處理了 alert，就不重試了
-                    if alert_handled:
-                        break
-                    
-                    # 判斷是否應該重試
-                    should_retry = (
-                        attempt < max_retries - 1 and
-                        ("closed" in error_msg.lower() or 
-                         "timeout" in error_msg.lower() or
-                         "target page" in error_msg.lower() or
-                         "context" in error_msg.lower())
-                    )
-                    
-                    if should_retry:
-                        retry_delay = min(2 ** attempt, 5)
-                        logger.warning(f"    [{index+1}] 重試 {attempt+1}/{max_retries}: {error_msg}")
-                        await asyncio.sleep(retry_delay)
-                        continue
-                    else:
-                        # 最終失敗
-                        fetch_time = (datetime.now() - detail_start).total_seconds()
-                        logger.error(f"    [{index+1}] 最終失敗 (重試{attempt}次): {error_msg}")
-                        
-                        # 確保 current_record 存在
-                        if current_record is None:
-                            current_record = {
-                                'index': global_index,
-                                'date': '',
-                                'time': '',
-                                'code': '',
-                                'company': f'Unknown_{global_index}',
-                                'subject': '',
-                                'hasDetail': True
-                            }
-                        
-                        return {
-                            **current_record,
-                            "detail": {
-                                "error": error_msg,
-                                "fetched": False,
-                                "fetch_time_seconds": fetch_time,
-                                "retry_count": attempt,
-                                "final_failure": True,
-                                "alert_message": alert_message if alert_message else None
-                            }
-                        }
-    
-    # 併發處理所有按鈕
-    tasks = [
-        _process_single_button(button, i) 
-        for i, button in enumerate(buttons)
-    ]
-    
-    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # 處理例外情況 - 確保即使有異常也返回有效資料
-    processed_results = []
-    for i, result in enumerate(batch_results):
-        global_index = offset + i
-        
-        if isinstance(result, Exception):
-            logger.error(f"    批次項目 {i} 發生例外: {result}")
-            
-            # 安全獲取記錄
+            # 獲取基本資料
             current_record = None
             if global_index < len(main_data) and main_data[global_index] is not None:
                 current_record = main_data[global_index]
@@ -701,35 +443,151 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                     'date': 'N/A',
                     'time': '',
                     'code': '',
-                    'company': f'Exception_{global_index}',
+                    'company': f'Unknown_{global_index}',
                     'subject': '',
                     'hasDetail': True
                 }
             
-            # 即使發生異常，也要返回基本資料結構
-            processed_results.append({
-                **current_record,
-                "detail": {
-                    "html": "<html><body>Exception occurred</body></html>",
-                    "structured": {
-                        "tables_count": 0,
-                        "page_text": f"處理異常: {str(result)}",
-                        "title": "",
-                        "has_content": False,
-                        "url": "about:blank",
-                        "content_length": len(str(result))
-                    },
-                    "fetched": False,
-                    "fetch_time_seconds": 0,
-                    "exception_in_batch": True,
-                    "error": str(result)
-                }
-            })
-        else:
-            # 正常結果，直接加入
-            processed_results.append(result)
+            company_name = current_record.get('company', 'N/A')
+            data_date = current_record.get('date', 'N/A')
+            
+            max_retries = 5
+            for attempt in range(max_retries):
+                detail_start = datetime.now()
+                
+                if attempt == 0:
+                    logger.info(f"    [{index+1}] 處理 {company_name} ({data_date})")
+                else:
+                    logger.info(f"    [{index+1}] 重試 {attempt} - {company_name} ({data_date})")
+                
+                try:
+                    # 點擊按鈕
+                    await button.click()
+                    
+                    # 短暫等待，讓 Alert 有時間出現
+                    await asyncio.sleep(2)
+                    
+                    # 檢查是否有新頁面
+                    pages = context.pages
+                    if len(pages) > 1:
+                        # 有新頁面 = 正常情況，嘗試處理
+                        detail_page = pages[-1]
+                        
+                        try:
+                            await detail_page.wait_for_load_state("networkidle", timeout=20000)
+                            
+                            detail_content = await detail_page.content()
+                            structured_detail = await detail_page.evaluate("""
+                                () => {
+                                    const tables = Array.from(document.querySelectorAll('table'));
+                                    const text_content = document.body.innerText;
+                                    return {
+                                        tables_count: tables.length,
+                                        page_text: text_content.slice(0, 2000),
+                                        title: document.title,
+                                        has_content: text_content.length > 100,
+                                        url: window.location.href,
+                                        content_length: text_content.length
+                                    };
+                                }
+                            """)
+                            
+                            await detail_page.close()
+                            fetch_time = (datetime.now() - detail_start).total_seconds()
+                            retry_suffix = f" (重試{attempt}次)" if attempt > 0 else ""
+                            logger.info(f"    完成正常頁面，{fetch_time:.1f}秒，{len(detail_content)//1024}KB{retry_suffix}")
+                            
+                            return {
+                                **current_record,
+                                "detail": {
+                                    "html": detail_content,
+                                    "structured": structured_detail,
+                                    "fetched": True,
+                                    "fetch_time_seconds": fetch_time,
+                                    "retry_count": attempt,
+                                    "page_type": "normal"
+                                }
+                            }
+                            
+                        except Exception as e:
+                            # 頁面處理失敗，關閉頁面後重試
+                            logger.warning(f"    頁面處理失敗: {str(e)[:100]}")
+                            try:
+                                await detail_page.close()
+                            except:
+                                pass
+                            
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(2)
+                                continue
+                            else:
+                                # 最終失敗
+                                raise e
+                    else:
+                        # 沒有新頁面 = Alert，立即返回，不重試
+                        fetch_time = (datetime.now() - detail_start).total_seconds()
+                        logger.info(f"    Alert 或無回應，{fetch_time:.1f}秒")
+                        
+                        return {
+                            **current_record,
+                            "detail": {
+                                "html": "<html><body>Alert or No Response</body></html>",
+                                "structured": {
+                                    "tables_count": 0,
+                                    "page_text": "系統提示或無回應",
+                                    "title": "",
+                                    "has_content": True,
+                                    "url": "about:blank",
+                                    "content_length": 15
+                                },
+                                "fetched": True,
+                                "fetch_time_seconds": fetch_time,
+                                "retry_count": attempt,
+                                "page_type": "alert_or_none"
+                            }
+                        }
+                        
+                except Exception as e:
+                    # 點擊或等待失敗
+                    if attempt < max_retries - 1:
+                        logger.warning(f"    點擊失敗重試 {attempt+1}: {str(e)[:100]}")
+                        await asyncio.sleep(2)
+                        continue
+                    else:
+                        # 最終失敗
+                        fetch_time = (datetime.now() - detail_start).total_seconds()
+                        logger.error(f"    最終失敗: {str(e)}")
+                        
+                        return {
+                            **current_record,
+                            "detail": {
+                                "html": "<html><body>Final Failure</body></html>",
+                                "structured": {
+                                    "tables_count": 0,
+                                    "page_text": f"最終失敗: {str(e)[:100]}",
+                                    "title": "",
+                                    "has_content": False,
+                                    "url": "about:blank",
+                                    "content_length": len(str(e))
+                                },
+                                "fetched": False,
+                                "fetch_time_seconds": fetch_time,
+                                "retry_count": attempt,
+                                "page_type": "final_failure",
+                                "error": str(e)
+                            }
+                        }
     
-    return processed_results
+    # 併發處理所有按鈕
+    tasks = [
+        _process_single_button_safe(button, i) 
+        for i, button in enumerate(buttons)
+    ]
+    
+    # 確保所有任務都完成
+    results = await asyncio.gather(*tasks)
+    
+    return results
 
 
 # --------------------
