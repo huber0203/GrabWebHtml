@@ -463,10 +463,11 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                         logger.info(f"    [{index+1}] 使用預設記錄 {global_index}")
                     
                     company_name = current_record.get('company', 'N/A')
+                    data_date = current_record.get('date', 'N/A')
                     if attempt == 0:
-                        logger.info(f"    [{index+1}] 處理 {company_name}")
+                        logger.info(f"    [{index+1}] 處理 {company_name} ({data_date})")
                     else:
-                        logger.info(f"    [{index+1}] 重試 {attempt} - {company_name}")
+                        logger.info(f"    [{index+1}] 重試 {attempt} - {company_name} ({data_date})")
                     
                     # 設定 alert 監聽器
                     alert_handled = False
@@ -492,13 +493,20 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                     
                     try:
                         # 先嘗試正常流程：點擊並等待新頁面
+                        detail_page = None
                         try:
                             async with context.expect_page(timeout=20000) as new_page_info:
                                 await button.click()
+                                # 等待一下看是否有 Alert
+                                await asyncio.sleep(1)
+                                if alert_handled:
+                                    # 如果有 Alert，直接跳出
+                                    break
                                 detail_page = await new_page_info.value
                         except Exception as e:
-                            # 如果失敗，檢查是否有 Alert
+                            # 如果等待新頁面失敗，檢查是否因為 Alert
                             if alert_handled:
+                                logger.info(f"    [{index+1}] Alert 處理完成: {alert_message}")
                                 safe_alert_message = alert_message or "系統提示：無法取得詳細資料"
                                 return {
                                     **current_record,
@@ -520,6 +528,28 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                             else:
                                 # 沒有 Alert，就是真的失敗了
                                 raise e
+                        
+                        # 如果已經處理了 Alert，直接返回
+                        if alert_handled:
+                            logger.info(f"    [{index+1}] Alert 處理完成: {alert_message}")
+                            safe_alert_message = alert_message or "系統提示：無法取得詳細資料"
+                            return {
+                                **current_record,
+                                "detail": {
+                                    "html": "<html><body>Alert</body></html>",
+                                    "structured": {
+                                        "tables_count": 0,
+                                        "page_text": safe_alert_message,
+                                        "title": "",
+                                        "has_content": True,
+                                        "url": "about:blank",
+                                        "content_length": len(safe_alert_message)
+                                    },
+                                    "fetched": True,
+                                    "fetch_time_seconds": (datetime.now() - detail_start).total_seconds(),
+                                    "retry_count": attempt
+                                }
+                            }
                     
                     finally:
                         # 移除 dialog 監聽器
@@ -652,12 +682,13 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
     
     batch_results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    # 處理例外情況
+    # 處理例外情況 - 確保即使有異常也返回有效資料
     processed_results = []
     for i, result in enumerate(batch_results):
+        global_index = offset + i
+        
         if isinstance(result, Exception):
             logger.error(f"    批次項目 {i} 發生例外: {result}")
-            global_index = offset + i
             
             # 安全獲取記錄
             current_record = None
@@ -667,7 +698,7 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
             if current_record is None or not isinstance(current_record, dict):
                 current_record = {
                     'index': global_index,
-                    'date': '',
+                    'date': 'N/A',
                     'time': '',
                     'code': '',
                     'company': f'Exception_{global_index}',
@@ -675,16 +706,27 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                     'hasDetail': True
                 }
             
+            # 即使發生異常，也要返回基本資料結構
             processed_results.append({
                 **current_record,
                 "detail": {
-                    "error": str(result),
+                    "html": "<html><body>Exception occurred</body></html>",
+                    "structured": {
+                        "tables_count": 0,
+                        "page_text": f"處理異常: {str(result)}",
+                        "title": "",
+                        "has_content": False,
+                        "url": "about:blank",
+                        "content_length": len(str(result))
+                    },
                     "fetched": False,
                     "fetch_time_seconds": 0,
-                    "exception_in_batch": True
+                    "exception_in_batch": True,
+                    "error": str(result)
                 }
             })
         else:
+            # 正常結果，直接加入
             processed_results.append(result)
     
     return processed_results
