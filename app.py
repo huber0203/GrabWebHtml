@@ -355,24 +355,29 @@ async def get_main_data_safely(page):
                 const results = [];
                 
                 Array.from(dataRows).forEach((row, index) => {
-                    const cells = Array.from(row.cells);
-                    
-                    const hasViewButton = row.querySelector('button') && 
-                                         row.querySelector('button').textContent.includes('查看');
-                    
-                    if (cells.length >= 6 && hasViewButton) {
-                        // 確保所有字段都有預設值
-                        const record = {
-                            index: results.length,
-                            date: String(cells[0]?.querySelector('span')?.textContent?.trim() || cells[0]?.textContent?.trim() || ''),
-                            time: String(cells[1]?.querySelector('span')?.textContent?.trim() || cells[1]?.textContent?.trim() || ''),
-                            code: String(cells[2]?.querySelector('span')?.textContent?.trim() || cells[2]?.textContent?.trim() || ''),
-                            company: String(cells[3]?.querySelector('span')?.textContent?.trim() || cells[3]?.textContent?.trim() || `Company_${results.length}`),
-                            subject: String(cells[4]?.querySelector('span')?.textContent?.trim() || cells[4]?.textContent?.trim() || ''),
-                            hasDetail: Boolean(hasViewButton)
-                        };
+                    try {
+                        const cells = Array.from(row.cells);
                         
-                        results.push(record);
+                        const viewButton = row.querySelector('button');
+                        const hasViewButton = viewButton && viewButton.textContent.includes('查看');
+                        
+                        if (cells.length >= 6 && hasViewButton) {
+                            // 完全避免 DOM 物件，只提取純文字
+                            const record = {
+                                index: parseInt(results.length),
+                                date: String((cells[0]?.querySelector('span')?.textContent || cells[0]?.textContent || '').trim()),
+                                time: String((cells[1]?.querySelector('span')?.textContent || cells[1]?.textContent || '').trim()),
+                                code: String((cells[2]?.querySelector('span')?.textContent || cells[2]?.textContent || '').trim()),
+                                company: String((cells[3]?.querySelector('span')?.textContent || cells[3]?.textContent || '').trim()) || `Company_${results.length}`,
+                                subject: String((cells[4]?.querySelector('span')?.textContent || cells[4]?.textContent || '').trim()),
+                                hasDetail: Boolean(hasViewButton)
+                            };
+                            
+                            results.push(record);
+                        }
+                    } catch (e) {
+                        // 跳過有問題的列
+                        console.log('Skip row error:', e);
                     }
                 });
                 
@@ -938,30 +943,42 @@ async def fetch_mops_flexible(req: FlexibleMopsRequest):
                         }
                         safe_main_data.append(safe_record)
                 
-                view_buttons = await page.query_selector_all('table tbody tr button:has-text("查看")')
-                logger.info(f"找到 {len(view_buttons)} 個查看按鈕")
-                
-                all_results = []
-                
-                # 分批併發處理
-                for batch_start in range(0, len(view_buttons), req.batch_size):
-                    batch_end = min(batch_start + req.batch_size, len(view_buttons))
-                    batch_buttons = view_buttons[batch_start:batch_end]
-                    batch_num = batch_start // req.batch_size + 1
-                    total_batches = (len(view_buttons) + req.batch_size - 1) // req.batch_size
+                # 只從有資料的列中找查看按鈕
+                logger.info("查找查看按鈕...")
+                try:
+                    view_buttons_elements = await page.query_selector_all('table tbody tr button:has-text("查看")')
+                    # 不要直接傳遞 Playwright 元素，而是記錄它們的位置
+                    button_count = len(view_buttons_elements)
+                    logger.info(f"找到 {button_count} 個查看按鈕")
                     
-                    logger.info(f"處理第 {batch_num}/{total_batches} 批")
+                    all_results = []
                     
-                    batch_results = await _process_batch_concurrent(
-                        context, batch_buttons, safe_main_data, batch_start, req.max_concurrent
-                    )
+                    # 分批併發處理
+                    for batch_start in range(0, button_count, req.batch_size):
+                        batch_end = min(batch_start + req.batch_size, button_count)
+                        # 每次重新查詢按鈕，避免元素失效
+                        current_buttons = await page.query_selector_all('table tbody tr button:has-text("查看")')
+                        batch_buttons = current_buttons[batch_start:batch_end]
+                        batch_num = batch_start // req.batch_size + 1
+                        total_batches = (button_count + req.batch_size - 1) // req.batch_size
+                        
+                        logger.info(f"處理第 {batch_num}/{total_batches} 批")
+                        
+                        batch_results = await _process_batch_concurrent(
+                            context, batch_buttons, safe_main_data, batch_start, req.max_concurrent
+                        )
+                        
+                        all_results.extend(batch_results)
+                        
+                        if batch_num < total_batches:
+                            await asyncio.sleep(1)
                     
-                    all_results.extend(batch_results)
+                    return all_results
                     
-                    if batch_num < total_batches:
-                        await asyncio.sleep(1)
-                
-                return all_results
+                except Exception as e:
+                    logger.error(f"按鈕處理階段失敗: {e}")
+                    # 即使按鈕處理失敗，也返回基本的主資料
+                    return safe_main_data
                 
             finally:
                 await context.close()
