@@ -900,10 +900,9 @@ async def fetch_mops_concurrent(req: RenderRequest):
 
 @app.post("/mops-flexible")
 async def fetch_mops_flexible(req: FlexibleMopsRequest):
-    """靈活配置的 MOPS 抓取"""
+    """靈活配置的 MOPS 抓取 (最終正確、簡潔版)"""
     
     logger.info(f"靈活抓取設定 - 批次大小: {req.batch_size}, 最大併發: {req.max_concurrent}")
-    
     start_time = datetime.now()
     
     async def _flexible_fetch():
@@ -924,176 +923,44 @@ async def fetch_mops_flexible(req: FlexibleMopsRequest):
                 await page.goto(str(req.url), wait_until="networkidle", timeout=60000)
                 await page.wait_for_selector("table", timeout=30000)
                 
-                # 取得主表格資料
+                # 1. 獲取已在源頭清理乾淨的資料
+                #    `get_main_data_safely` 已經是修正好的，返回的資料是安全的。
                 main_data = await get_main_data_safely(page)
-                logger.info(f"找到 {len(main_data)} 筆記錄")
                 
-                # 確保 main_data 完全可序列化
-                safe_main_data = []
-                for record in main_data:
-                    if isinstance(record, dict):
-                        safe_record = {
-                            'index': int(record.get('index', 0)),
-                            'date': str(record.get('date', '')),
-                            'time': str(record.get('time', '')),
-                            'code': str(record.get('code', '')),
-                            'company': str(record.get('company', '')),
-                            'subject': str(record.get('subject', '')),
-                            'hasDetail': bool(record.get('hasDetail', True))
-                        }
-                        safe_main_data.append(safe_record)
+                # 2. 【重要】不再需要 safe_main_data 的二次處理迴圈，直接使用 main_data
                 
-                # 分批處理按鈕點擊 - 避免傳遞 Playwright 物件
-                logger.info("開始分批處理...")
-                try:
-                    all_results = []
-                    
-                    # 分批處理，每批重新查詢按鈕避免物件失效
-                    for batch_start in range(0, button_count, req.batch_size):
-                        batch_end = min(batch_start + req.batch_size, button_count)
-                        batch_num = batch_start // req.batch_size + 1
-                        total_batches = (button_count + req.batch_size - 1) // req.batch_size
-                        
-                        logger.info(f"處理第 {batch_num}/{total_batches} 批 (項目 {batch_start+1}-{batch_end})")
-                        
-                        # 每批重新查詢按鈕
-                        fresh_buttons = await page.query_selector_all('table tbody tr button:has-text("查看")')
-                        batch_buttons = fresh_buttons[batch_start:batch_end]
-                        
-                        # 處理這一批
-                        batch_results = []
-                        semaphore = asyncio.Semaphore(req.max_concurrent)
-                        
-                        async def process_single_in_batch(btn_index):
-                            async with semaphore:
-                                global_index = batch_start + btn_index
-                                
-                                # 安全獲取記錄
-                                if global_index < len(safe_main_data):
-                                    record = safe_main_data[global_index]
-                                else:
-                                    record = {
-                                        'index': global_index,
-                                        'date': 'N/A',
-                                        'time': '',
-                                        'code': '',
-                                        'company': f'Missing_{global_index}',
-                                        'subject': '',
-                                        'hasDetail': True
-                                    }
-                                
-                                company_name = record.get('company', 'N/A')
-                                data_date = record.get('date', 'N/A')
-                                logger.info(f"    [{btn_index+1}] 處理 {company_name} ({data_date})")
-                                
-                                detail_start = datetime.now()
-                                
-                                try:
-                                    # 點擊按鈕
-                                    await batch_buttons[btn_index].click()
-                                    await asyncio.sleep(2)
-                                    
-                                    # 檢查是否有新頁面
-                                    pages = context.pages
-                                    if len(pages) > 1:
-                                        # 正常頁面處理
-                                        detail_page = pages[-1]
-                                        await detail_page.wait_for_load_state("networkidle", timeout=15000)
-                                        
-                                        content = await detail_page.content()
-                                        structured = await detail_page.evaluate("""
-                                            () => ({
-                                                tables_count: parseInt(document.querySelectorAll('table').length),
-                                                page_text: String(document.body.innerText || '').slice(0, 2000),
-                                                title: String(document.title || ''),
-                                                has_content: Boolean((document.body.innerText || '').length > 100),
-                                                url: String(window.location.href || ''),
-                                                content_length: parseInt((document.body.innerText || '').length)
-                                            })
-                                        """)
-                                        
-                                        await detail_page.close()
-                                        
-                                        fetch_time = (datetime.now() - detail_start).total_seconds()
-                                        logger.info(f"    完成，{fetch_time:.1f}秒，{len(content)//1024}KB")
-                                        
-                                        return {
-                                            **record,
-                                            "detail": {
-                                                "html": str(content),
-                                                "structured": structured,
-                                                "fetched": True,
-                                                "fetch_time_seconds": float(fetch_time),
-                                                "page_type": "normal"
-                                            }
-                                        }
-                                    else:
-                                        # Alert 情況
-                                        fetch_time = (datetime.now() - detail_start).total_seconds()
-                                        logger.info(f"    Alert，{fetch_time:.1f}秒")
-                                        
-                                        return {
-                                            **record,
-                                            "detail": {
-                                                "html": "<html><body>Alert</body></html>",
-                                                "structured": {
-                                                    "tables_count": 0,
-                                                    "page_text": "系統提示",
-                                                    "title": "",
-                                                    "has_content": True,
-                                                    "url": "about:blank",
-                                                    "content_length": 8
-                                                },
-                                                "fetched": True,
-                                                "fetch_time_seconds": float(fetch_time),
-                                                "page_type": "alert"
-                                            }
-                                        }
-                                        
-                                except Exception as e:
-                                    fetch_time = (datetime.now() - detail_start).total_seconds()
-                                    logger.warning(f"    失敗: {str(e)[:50]}")
-                                    
-                                    return {
-                                        **record,
-                                        "detail": {
-                                            "html": "<html><body>Failed</body></html>",
-                                            "structured": {
-                                                "tables_count": 0,
-                                                "page_text": f"處理失敗: {str(e)[:100]}",
-                                                "title": "",
-                                                "has_content": False,
-                                                "url": "about:blank",
-                                                "content_length": len(str(e))
-                                            },
-                                            "fetched": False,
-                                            "fetch_time_seconds": float(fetch_time),
-                                            "page_type": "failed",
-                                            "error": str(e)
-                                        }
-                                    }
-                        
-                        # 併發處理這一批
-                        tasks = [process_single_in_batch(i) for i in range(len(batch_buttons))]
-                        batch_results = await asyncio.gather(*tasks)
-                        all_results.extend(batch_results)
-                        
-                        success_count = sum(1 for r in batch_results if r.get('detail', {}).get('fetched', False))
-                        logger.info(f"批次完成 - 成功: {success_count}/{len(batch_results)}")
-                        
-                        if batch_num < total_batches:
-                            await asyncio.sleep(1)
-                    
-                    return all_results
-                    
-                except Exception as e:
-                    logger.error(f"分批處理失敗: {e}")
-                    return safe_main_data
+                # 3. 【重要】一次性獲取所有按鈕元素，避免在迴圈中重複查詢，效率更高
+                view_buttons = await page.query_selector_all('table tbody tr button:has-text("查看")')
+                logger.info(f"找到 {len(view_buttons)} 個查看按鈕，準備分批處理...")
                 
+                all_results = []
+                
+                # 4. 【重要】使用原本寫好的、可重用的輔助函式 `_process_batch_concurrent`
+                for batch_start in range(0, len(view_buttons), req.batch_size):
+                    batch_end = min(batch_start + req.batch_size, len(view_buttons))
+                    batch_buttons = view_buttons[batch_start:batch_end] # 直接對列表切片，簡單高效
+                    batch_num = batch_start // req.batch_size + 1
+                    total_batches = (len(view_buttons) + req.batch_size - 1) // req.batch_size
+                    
+                    # 這裡的日誌現在可以正常打印了
+                    logger.info(f"處理第 {batch_num}/{total_batches} 批...")
+                    
+                    # 直接調用輔助函式，傳入 `main_data`
+                    batch_results = await _process_batch_concurrent(
+                        context, batch_buttons, main_data, batch_start, req.max_concurrent
+                    )
+                    
+                    all_results.extend(batch_results)
+                    
+                    if batch_num < total_batches:
+                        await asyncio.sleep(1)
+                        
+                return all_results
+            
             finally:
                 await context.close()
                 await browser.close()
-    
+
     try:
         results = await _flexible_fetch()
         success_count = sum(1 for r in results if r.get('detail', {}).get('fetched', False))
@@ -1112,6 +979,8 @@ async def fetch_mops_flexible(req: FlexibleMopsRequest):
             "max_concurrent": req.max_concurrent
         }
     except Exception as e:
+        # 最高級別的錯誤捕獲，如果輔助函式內部有未處理的錯誤，會在這裡被捕捉
+        logger.error(f"Flexible fetch 發生致命錯誤: {e}", exc_info=True)
         raise HTTPException(status_code=502, detail=f"Flexible fetch failed: {e}")
 
 
