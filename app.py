@@ -16,7 +16,7 @@ import logging
 import sys
 import asyncio
 
-app = FastAPI(title="Universal HTML Fetcher", version="1.6.0")
+app = FastAPI(title="Universal HTML Fetcher", version="1.7.0")
 
 # 設定日誌
 logging.basicConfig(
@@ -319,12 +319,16 @@ async def get_main_data_safely(page):
 # --------------------
 # MOPS 專用端點
 # --------------------
-async def _fetch_mops_details_concurrently(req: FlexibleMopsRequest, page, context):
-    """使用 Locator API 併發抓取 MOPS 詳細資料的核心函式"""
+async def _fetch_mops_details_concurrently(req: FlexibleMopsRequest, page, context, limit: Optional[int] = None):
+    """使用 Locator API 併發抓取 MOPS 詳細資料的核心函式，並包含重試機制"""
     main_data = await get_main_data_safely(page)
     locator = page.locator('table tbody tr button:has-text("查看")')
     button_count = await locator.count()
-    logger.info(f"找到 {button_count} 個查看按鈕，準備併發處理...")
+
+    if limit is not None:
+        button_count = min(button_count, limit)
+
+    logger.info(f"找到 {await locator.count()} 個按鈕，準備處理其中 {button_count} 個...")
 
     semaphore = asyncio.Semaphore(req.max_concurrent)
 
@@ -333,37 +337,67 @@ async def _fetch_mops_details_concurrently(req: FlexibleMopsRequest, page, conte
             record = main_data[index] if index < len(main_data) else {'company': f'Unknown_{index}', 'date': 'N/A'}
             company_name = record.get('company', 'N/A')
             data_date = record.get('date', 'N/A')
-            logger.info(f"  處理 {index + 1}/{button_count}: {company_name} ({data_date})")
             
-            detail_start = datetime.now()
-            try:
-                async with context.expect_page(timeout=15000) as page_info:
-                    await locator.nth(index).click(timeout=10000)
-                detail_page = await page_info.value
-                
-                try:
-                    await detail_page.wait_for_load_state("networkidle", timeout=20000)
-                    detail_content = await detail_page.content()
-                    structured = await detail_page.evaluate("() => ({ title: document.title, url: window.location.href, text_length: document.body.innerText.length })")
-                    await detail_page.close()
-                    
-                    fetch_time = (datetime.now() - detail_start).total_seconds()
-                    logger.info(f"    -> 成功, {fetch_time:.1f}s, {len(detail_content)//1024}KB")
-                    return {**record, "detail": {"html": detail_content, "structured": structured, "fetched": True, "fetch_time_seconds": fetch_time}}
-                except Exception as page_e:
-                    logger.warning(f"    -> 頁面處理失敗: {str(page_e)[:100]}")
-                    await detail_page.close()
-                    raise page_e
+            max_retries = 10  # 根據您的要求增加重試次數
 
-            except Exception as e:
-                # 可能是 alert 或點擊超時
-                fetch_time = (datetime.now() - detail_start).total_seconds()
-                if "expect_page" in str(e).lower():
-                    logger.info(f"    -> Alert 或無新分頁, {fetch_time:.1f}s")
-                    return {**record, "detail": {"fetched": True, "page_type": "alert_or_none"}}
+            for attempt in range(max_retries):
+                if attempt == 0:
+                    logger.info(f"  處理 {index + 1}/{button_count}: {company_name} ({data_date})")
                 else:
-                    logger.error(f"    -> 點擊失敗: {str(e)[:100]}")
-                    return {**record, "detail": {"fetched": False, "error": str(e)}}
+                    logger.warning(f"  重試 {attempt}/{max_retries-1} - {company_name} ({data_date})")
+
+                detail_start = datetime.now()
+                try:
+                    # 結合點擊和等待新頁面的操作
+                    async with context.expect_page(timeout=15000) as page_info:
+                        await locator.nth(index).click(timeout=10000)
+                    detail_page = await page_info.value
+                    
+                    # 處理新分頁的內部邏輯
+                    try:
+                        await detail_page.wait_for_load_state("networkidle", timeout=20000)
+                        detail_content = await detail_page.content()
+                        structured = await detail_page.evaluate("() => ({ title: document.title, url: window.location.href, text_length: document.body.innerText.length })")
+                        await detail_page.close()
+                        
+                        fetch_time = (datetime.now() - detail_start).total_seconds()
+                        retry_suffix = f" (重試 {attempt} 次)" if attempt > 0 else ""
+                        logger.info(f"    -> 成功, {fetch_time:.1f}s, {len(detail_content)//1024}KB{retry_suffix}")
+                        
+                        # 成功後立即返回結果
+                        return {**record, "detail": {"html": detail_content, "structured": structured, "fetched": True, "fetch_time_seconds": fetch_time, "retry_count": attempt}}
+                    
+                    except Exception as page_e:
+                        logger.warning(f"    -> 頁面處理失敗: {str(page_e)[:100]}")
+                        try:
+                            await detail_page.close()
+                        except:
+                            pass # 頁面可能已經關閉
+                        
+                        # 如果不是最後一次嘗試，則等待後繼續重試
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2)
+                            continue 
+                        else: # 最後一次嘗試失敗，則拋出異常
+                            raise page_e
+
+                except Exception as e:
+                    fetch_time = (datetime.now() - detail_start).total_seconds()
+                    
+                    # 判斷是否為 Alert (沒有新分頁)，這種情況不重試
+                    if "expect_page" in str(e).lower():
+                        logger.info(f"    -> Alert 或無新分頁, {fetch_time:.1f}s (不重試)")
+                        return {**record, "detail": {"fetched": True, "page_type": "alert_or_none", "retry_count": attempt}}
+                    
+                    # 對於其他錯誤 (例如點擊超時)，則進行重試
+                    if attempt < max_retries - 1:
+                        logger.warning(f"    -> 點擊或等待失敗: {str(e)[:100]}")
+                        await asyncio.sleep(2)
+                        continue
+                    else:
+                        # 所有重試均告失敗
+                        logger.error(f"    -> 最終失敗於第 {attempt+1} 次嘗試: {str(e)}")
+                        return {**record, "detail": {"fetched": False, "error": str(e), "retry_count": attempt}}
 
     tasks = [_process_single_button(i) for i in range(button_count)]
     return await asyncio.gather(*tasks)
@@ -371,7 +405,7 @@ async def _fetch_mops_details_concurrently(req: FlexibleMopsRequest, page, conte
 
 @app.post("/mops-flexible")
 async def fetch_mops_flexible(req: FlexibleMopsRequest):
-    """靈活配置的 MOPS 抓取 (使用 Locator API 提高穩定性)"""
+    """靈活配置的 MOPS 抓取 (使用 Locator API 和增強的重試機制)"""
     logger.info(f"靈活抓取設定 - 批次大小: {req.batch_size}, 最大併發: {req.max_concurrent}")
     start_time = datetime.now()
     
@@ -405,47 +439,22 @@ async def fetch_mops_quick_test(req: RenderRequest):
     logger.info(f"開始 MOPS 快速測試: {req.url}")
     mops_req = FlexibleMopsRequest(url=str(req.url), max_concurrent=3)
     
-    # 修改 mops_req 的 url 屬性以進行測試
-    setattr(mops_req, 'url', str(req.url))
-
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         context = await browser.new_context()
         page = await context.new_page()
         try:
             await page.goto(mops_req.url, wait_until="networkidle", timeout=60000)
-            main_data = await get_main_data_safely(page)
-            locator = page.locator('table tbody tr button:has-text("查看")')
-            test_count = min(3, await locator.count())
-            
-            # 建立一個只包含前幾項的 locator
-            test_locator = locator.first if test_count > 0 else None
-            for i in range(1, test_count):
-                test_locator = test_locator.or_(locator.nth(i))
-
-            if test_locator:
-                 # 重新實作一個簡化版的併發抓取邏輯
-                semaphore = asyncio.Semaphore(mops_req.max_concurrent)
-                async def _process_test(index):
-                    async with semaphore:
-                        try:
-                            async with context.expect_page(timeout=15000) as page_info:
-                                await locator.nth(index).click()
-                            detail_page = await page_info.value
-                            content = await detail_page.content()
-                            await detail_page.close()
-                            return {"index": index, "success": True, "content_size": len(content)}
-                        except Exception as e:
-                            return {"index": index, "success": False, "error": str(e)}
-                tasks = [_process_test(i) for i in range(test_count)]
-                results = await asyncio.gather(*tasks)
-            else:
-                results = []
-
+            await page.wait_for_selector("table", timeout=30000)
+            # 調用核心函式並限制只處理3筆
+            results = await _fetch_mops_details_concurrently(mops_req, page, context, limit=3)
+        except Exception as e:
+             logger.error(f"Quick test 發生錯誤: {e}", exc_info=True)
+             results = [] # 發生錯誤時返回空結果
         finally:
             await browser.close()
     
-    success_rate = sum(1 for r in results if r["success"]) / len(results) * 100 if results else 0
+    success_rate = sum(1 for r in results if r.get('detail', {}).get('fetched')) / len(results) * 100 if results else 0
     return {"test_results": results, "success_rate": success_rate}
 
 # --------------------
@@ -453,7 +462,7 @@ async def fetch_mops_quick_test(req: RenderRequest):
 # --------------------
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "version": "1.6.0"}
+    return {"ok": True, "version": "1.7.0"}
 
 # --------------------
 # 主程式入口
