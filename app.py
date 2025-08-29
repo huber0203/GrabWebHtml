@@ -477,37 +477,59 @@ async def _process_batch_concurrent(context, buttons, main_data, offset, max_con
                             await detail_page.wait_for_load_state("networkidle", timeout=20000)
                             
                             detail_content = await detail_page.content()
+                            
+                            # 確保 structured_detail 只包含可序列化的資料
                             structured_detail = await detail_page.evaluate("""
                                 () => {
                                     const tables = Array.from(document.querySelectorAll('table'));
-                                    const text_content = document.body.innerText;
+                                    const text_content = document.body.innerText || '';
+                                    const title = document.title || '';
+                                    const url = window.location.href || '';
+                                    
                                     return {
-                                        tables_count: tables.length,
-                                        page_text: text_content.slice(0, 2000),
-                                        title: document.title,
-                                        has_content: text_content.length > 100,
-                                        url: window.location.href,
-                                        content_length: text_content.length
+                                        tables_count: parseInt(tables.length) || 0,
+                                        page_text: String(text_content).slice(0, 2000),
+                                        title: String(title),
+                                        has_content: Boolean(text_content.length > 100),
+                                        url: String(url),
+                                        content_length: parseInt(text_content.length) || 0
                                     };
                                 }
                             """)
                             
                             await detail_page.close()
+                            detail_page = None  # 明確設為 None
+                            
                             fetch_time = (datetime.now() - detail_start).total_seconds()
                             retry_suffix = f" (重試{attempt}次)" if attempt > 0 else ""
                             logger.info(f"    完成正常頁面，{fetch_time:.1f}秒，{len(detail_content)//1024}KB{retry_suffix}")
                             
-                            return {
-                                **current_record,
+                            # 確保返回的資料完全可序列化
+                            result = {
+                                "index": current_record.get('index', global_index),
+                                "date": str(current_record.get('date', '')),
+                                "time": str(current_record.get('time', '')), 
+                                "code": str(current_record.get('code', '')),
+                                "company": str(current_record.get('company', '')),
+                                "subject": str(current_record.get('subject', '')),
+                                "hasDetail": bool(current_record.get('hasDetail', True)),
                                 "detail": {
-                                    "html": detail_content,
-                                    "structured": structured_detail,
+                                    "html": str(detail_content),
+                                    "structured": {
+                                        "tables_count": int(structured_detail.get('tables_count', 0)),
+                                        "page_text": str(structured_detail.get('page_text', '')),
+                                        "title": str(structured_detail.get('title', '')),
+                                        "has_content": bool(structured_detail.get('has_content', False)),
+                                        "url": str(structured_detail.get('url', '')),
+                                        "content_length": int(structured_detail.get('content_length', 0))
+                                    },
                                     "fetched": True,
-                                    "fetch_time_seconds": fetch_time,
-                                    "retry_count": attempt,
+                                    "fetch_time_seconds": float(fetch_time),
+                                    "retry_count": int(attempt),
                                     "page_type": "normal"
                                 }
                             }
+                            return result
                             
                         except Exception as e:
                             # 頁面處理失敗，關閉頁面後重試
