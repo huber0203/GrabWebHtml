@@ -364,13 +364,12 @@ async def get_main_data_safely(page):
                         // 確保所有字段都有預設值
                         const record = {
                             index: results.length,
-                            date: cells[0]?.querySelector('span')?.textContent?.trim() || cells[0]?.textContent?.trim() || '',
-                            time: cells[1]?.querySelector('span')?.textContent?.trim() || cells[1]?.textContent?.trim() || '',
-                            code: cells[2]?.querySelector('span')?.textContent?.trim() || cells[2]?.textContent?.trim() || '',
-                            company: cells[3]?.querySelector('span')?.textContent?.trim() || cells[3]?.textContent?.trim() || `Company_${results.length}`,
-                            subject: cells[4]?.querySelector('span')?.textContent?.trim() || cells[4]?.textContent?.trim() || '',
-                            hasDetail: hasViewButton,
-                            rowElement: index
+                            date: String(cells[0]?.querySelector('span')?.textContent?.trim() || cells[0]?.textContent?.trim() || ''),
+                            time: String(cells[1]?.querySelector('span')?.textContent?.trim() || cells[1]?.textContent?.trim() || ''),
+                            code: String(cells[2]?.querySelector('span')?.textContent?.trim() || cells[2]?.textContent?.trim() || ''),
+                            company: String(cells[3]?.querySelector('span')?.textContent?.trim() || cells[3]?.textContent?.trim() || `Company_${results.length}`),
+                            subject: String(cells[4]?.querySelector('span')?.textContent?.trim() || cells[4]?.textContent?.trim() || ''),
+                            hasDetail: Boolean(hasViewButton)
                         };
                         
                         results.push(record);
