@@ -924,6 +924,21 @@ async def fetch_mops_flexible(req: FlexibleMopsRequest):
                 main_data = await get_main_data_safely(page)
                 logger.info(f"找到 {len(main_data)} 筆記錄")
                 
+                # 確保 main_data 完全可序列化
+                safe_main_data = []
+                for record in main_data:
+                    if isinstance(record, dict):
+                        safe_record = {
+                            'index': int(record.get('index', 0)),
+                            'date': str(record.get('date', '')),
+                            'time': str(record.get('time', '')),
+                            'code': str(record.get('code', '')),
+                            'company': str(record.get('company', '')),
+                            'subject': str(record.get('subject', '')),
+                            'hasDetail': bool(record.get('hasDetail', True))
+                        }
+                        safe_main_data.append(safe_record)
+                
                 view_buttons = await page.query_selector_all('table tbody tr button:has-text("查看")')
                 logger.info(f"找到 {len(view_buttons)} 個查看按鈕")
                 
@@ -939,7 +954,7 @@ async def fetch_mops_flexible(req: FlexibleMopsRequest):
                     logger.info(f"處理第 {batch_num}/{total_batches} 批")
                     
                     batch_results = await _process_batch_concurrent(
-                        context, batch_buttons, main_data, batch_start, req.max_concurrent
+                        context, batch_buttons, safe_main_data, batch_start, req.max_concurrent
                     )
                     
                     all_results.extend(batch_results)
