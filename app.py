@@ -105,7 +105,7 @@ async def detect_page_version(page) -> str:
     return "old"  # 預設為舊版
 
 # --- 處理舊版頁面的單一列 ---
-async def process_old_version_row(row_locator: Locator, index: int, clean_html: bool) -> CompanyInfo:
+async def process_old_version_row(row_locator: Locator, index: int, clean_html: bool, max_retries: int = 10) -> CompanyInfo:
     """處理舊版 MOPS 頁面的單一表格列（含重試機制）"""
     base_info = {
         "index": index,
@@ -222,7 +222,7 @@ async def process_old_version_row(row_locator: Locator, index: int, clean_html: 
     return CompanyInfo(**base_info)
 
 # --- 處理新版頁面的單一列 ---
-async def process_new_version_row(row_locator: Locator, index: int, clean_html: bool) -> CompanyInfo:
+async def process_new_version_row(row_locator: Locator, index: int, clean_html: bool, max_retries: int = 10) -> CompanyInfo:
     """處理新版 MOPS 頁面的單一表格列（含重試機制）"""
     base_info = {
         "index": index,
@@ -236,14 +236,30 @@ async def process_new_version_row(row_locator: Locator, index: int, clean_html: 
         cell_count = await cells.count()
         
         if cell_count >= 5:
-            base_info["date"] = await cells.nth(0).inner_text()
-            base_info["time"] = await cells.nth(1).inner_text()
-            base_info["code"] = await cells.nth(2).inner_text()
-            base_info["company"] = await cells.nth(3).inner_text()
-            base_info["subject"] = (await cells.nth(4).inner_text()).replace('\r\n', ' ').strip()
+            # 嘗試提取每個欄位的文字內容
+            date_text = (await cells.nth(0).inner_text()).strip()
+            time_text = (await cells.nth(1).inner_text()).strip()
+            code_text = (await cells.nth(2).inner_text()).strip()
+            company_text = (await cells.nth(3).inner_text()).strip()
+            subject_text = (await cells.nth(4).inner_text()).replace('\r\n', ' ').replace('\n', ' ').strip()
+            
+            base_info["date"] = date_text if date_text else "N/A"
+            base_info["time"] = time_text if time_text else "N/A"
+            base_info["code"] = code_text if code_text else "N/A"
+            base_info["company"] = company_text if company_text else f"Unknown_{index}"
+            base_info["subject"] = subject_text if subject_text else "N/A"
             base_info["hasDetail"] = True
+        else:
+            # 如果欄位數量不足，嘗試顯示偵錯資訊
+            logger.warning(f"Index {index} 只找到 {cell_count} 個欄位，預期至少 5 個")
+            # 顯示實際找到的內容
+            for i in range(cell_count):
+                cell_text = await cells.nth(i).inner_text()
+                logger.debug(f"  欄位 {i}: {cell_text[:30]}...")
 
-        logger.info(f"處理中 (Index {index}): {base_info['code']} {base_info['company']}")
+        # 準備標題預覽（限制長度）
+        subject_preview = base_info['subject'][:50] + "..." if len(base_info['subject']) > 50 else base_info['subject']
+        logger.info(f"處理中 (Index {index}): {base_info['date']} {base_info['time']} {base_info['code']} {base_info['company']} - {subject_preview}")
 
         # 新版可能使用 button 而非 input
         view_button = row_locator.locator('button:has-text("查看"), input[value*="查看"], a:has-text("查看")')
@@ -351,7 +367,7 @@ class MopsRequest(BaseModel):
     limit: Optional[int] = Field(None, description="限制處理筆數", ge=1)
     clean_html: bool = Field(False, description="是否清理 HTML")
     wait_time: int = Field(5, description="新版頁面額外等待時間（秒）", ge=0, le=30)
-    max_retries: int = Field(3, description="失敗重試次數", ge=1, le=10)
+    max_retries: int = Field(10, description="失敗重試次數", ge=1, le=20)  # 預設改為 10
 
 @app.post("/scrape-mops", response_model=ScrapeResponse)
 async def scrape_mops_data(req: MopsRequest):
@@ -389,10 +405,12 @@ async def scrape_mops_data(req: MopsRequest):
                 # 嘗試多種可能的表格選擇器
                 possible_selectors = [
                     'table tbody tr:has(button:has-text("查看"))',
+                    'table tbody tr:has(button)',  # 更通用的按鈕選擇器
                     'div.table-container tr:has(button)',
                     '.data-table tbody tr',
                     'table tr:has(td)',
-                    '[role="table"] [role="row"]:has(button)'
+                    '[role="table"] [role="row"]:has(button)',
+                    'tbody tr:has(td:nth-child(5))'  # 至少有5個欄位的列
                 ]
                 
                 rows_locator = None
@@ -445,9 +463,9 @@ async def scrape_mops_data(req: MopsRequest):
             async def process_with_semaphore(row_locator, index):
                 async with semaphore:
                     if page_version == "new":
-                        return await process_new_version_row(row_locator, index, req.clean_html)
+                        return await process_new_version_row(row_locator, index, req.clean_html, req.max_retries)
                     else:
-                        return await process_old_version_row(row_locator, index, req.clean_html)
+                        return await process_old_version_row(row_locator, index, req.clean_html, req.max_retries)
             
             tasks = [
                 process_with_semaphore(rows_locator.nth(i), i) 
