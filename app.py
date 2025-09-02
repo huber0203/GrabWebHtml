@@ -180,20 +180,19 @@ async def scrape_mops_data(req: MopsRequest):
             logger.info(f"正在導航至: {req.url}")
             await page.goto(str(req.url), timeout=60000, wait_until='domcontentloaded')
             
-            # --- 【關鍵修正】---
+            # --- 【最終關鍵修正】---
             # 智慧判斷是否需要點擊「查詢」按鈕
             if "t05sr01_1" in str(req.url):
-                logger.info("偵測到為「當日資料」頁面，點擊「查詢」按鈕以載入資料...")
-                query_button = page.locator('input[type="button"][value=" 查 詢 "]')
-                await query_button.click(timeout=15000)
-                # 點擊後短暫等待，讓網路請求有時間發出
-                await asyncio.sleep(1)
+                logger.info("偵測到為「當日資料」頁面，點擊「查詢」按鈕...")
+                async with page.expect_response("**/ajax_t05sr01_1", timeout=60000) as response_info:
+                    await page.locator('input[type="button"][value=" 查 詢 "]').click(timeout=15000)
+                response = await response_info.value
+                logger.info(f"背景資料 API (ajax_t05sr01_1) 載入完成，狀態: {response.status}")
             else:
-                logger.info("偵測到為「歷史資料」或特定日期頁面，將直接等待資料載入...")
-
-            # 【修正】統一等待結果表格的第一列資料出現，這是比 networkidle 更可靠的指標
-            logger.info("等待查詢結果載入...")
-            await page.locator('table.hasBorder > tbody > tr').first.wait_for(timeout=60000)
+                logger.info("偵測到為「歷史資料」頁面，等待表格出現...")
+                # 對於歷史資料頁面，直接等待第一行資料出現即可
+                await page.locator('table.hasBorder > tbody > tr').first.wait_for(timeout=60000)
+            
             logger.info("查詢結果表格已成功載入。")
             # --- 【修正結束】---
             
@@ -204,6 +203,14 @@ async def scrape_mops_data(req: MopsRequest):
             # 應用 limit 限制
             process_count = min(row_count, req.limit) if req.limit is not None else row_count
             logger.info(f"找到 {row_count} 筆可處理的資料，將處理其中 {process_count} 筆...")
+
+            if process_count == 0:
+                logger.warning("在頁面上未找到任何可處理的資料列。")
+                await browser.close()
+                return ScrapeResponse(
+                    success=True, total_records=0, successful_details=0, failed_details=0, 
+                    total_time_seconds=0, data=[], timestamp=datetime.now()
+                )
 
             # 建立非同步任務列表
             semaphore = asyncio.Semaphore(req.max_concurrent)
@@ -250,7 +257,7 @@ async def scrape_mops_data(req: MopsRequest):
 # --- 健康檢查 ---
 @app.get("/healthz", summary="健康檢查")
 def healthz():
-    return {"status": "ok", "version": "2.3.0-stable-wait"}
+    return {"status": "ok", "version": "2.4.0-final"}
 
 # --- 程式進入點 ---
 if __name__ == "__main__":
