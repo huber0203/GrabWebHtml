@@ -368,6 +368,7 @@ class MopsRequest(BaseModel):
     clean_html: bool = Field(False, description="是否清理 HTML")
     wait_time: int = Field(5, description="新版頁面額外等待時間（秒）", ge=0, le=30)
     max_retries: int = Field(10, description="失敗重試次數", ge=1, le=20)  # 預設改為 10
+    batch_delay: float = Field(0, description="每批次完成後等待時間（秒）", ge=0, le=30)
 
 @app.post("/scrape-mops", response_model=ScrapeResponse)
 async def scrape_mops_data(req: MopsRequest):
@@ -468,15 +469,37 @@ async def scrape_mops_data(req: MopsRequest):
                         return await process_old_version_row(row_locator, index, req.clean_html, req.max_retries)
             
             # 在建立任務前記錄設定
-            logger.info(f"使用設定: max_retries={req.max_retries}, max_concurrent={req.max_concurrent}")
+            logger.info(f"使用設定: max_retries={req.max_retries}, max_concurrent={req.max_concurrent}, batch_delay={req.batch_delay}s")
             
-            tasks = [
-                process_with_semaphore(rows_locator.nth(i), i) 
-                for i in range(process_count)
-            ]
-            
-            # 執行所有任務
-            results = await asyncio.gather(*tasks)
+            # 批次處理邏輯
+            results = []
+            if req.batch_delay > 0:
+                # 分批處理，每批 max_concurrent 筆
+                for batch_start in range(0, process_count, req.max_concurrent):
+                    batch_end = min(batch_start + req.max_concurrent, process_count)
+                    batch_size = batch_end - batch_start
+                    
+                    logger.info(f"開始處理批次: {batch_start//req.max_concurrent + 1}, 資料 {batch_start}-{batch_end-1} (共 {batch_size} 筆)")
+                    
+                    batch_tasks = [
+                        process_with_semaphore(rows_locator.nth(i), i) 
+                        for i in range(batch_start, batch_end)
+                    ]
+                    
+                    batch_results = await asyncio.gather(*batch_tasks)
+                    results.extend(batch_results)
+                    
+                    # 如果不是最後一批，則等待
+                    if batch_end < process_count:
+                        logger.info(f"批次完成，等待 {req.batch_delay} 秒後繼續...")
+                        await asyncio.sleep(req.batch_delay)
+            else:
+                # 原本的邏輯：全部同時處理（受 semaphore 限制）
+                tasks = [
+                    process_with_semaphore(rows_locator.nth(i), i) 
+                    for i in range(process_count)
+                ]
+                results = await asyncio.gather(*tasks)
             
         except Exception as e:
             logger.error(f"爬取失敗: {e}", exc_info=True)
