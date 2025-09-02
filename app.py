@@ -3,10 +3,11 @@
 import asyncio
 import logging
 import sys
+import os # 匯入 os 模組以讀取環境變數
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, AnyHttpUrl
 from playwright.async_api import async_playwright, Locator, TimeoutError as PlaywrightTimeoutError
 import uvicorn
 
@@ -146,35 +147,56 @@ async def root():
     }
 
 class MopsRequest(BaseModel):
+    # 【修正】新增 url 欄位，並給予預設值
+    url: AnyHttpUrl = Field(
+        "https://mops.twse.com.tw/mops/web/t05sr01_1", 
+        description="要抓取的目標 MOPS 頁面 URL。預設為當日重大訊息。"
+    )
     max_concurrent: int = Field(5, description="最大同時處理的併發任務數量", ge=1, le=20)
     limit: Optional[int] = Field(None, description="限制處理的資料筆數，用於測試", ge=1)
 
-@app.post("/scrape-mops", response_model=ScrapeResponse, summary="抓取 MOPS 當日重大訊息")
+@app.post("/scrape-mops", response_model=ScrapeResponse, summary="抓取 MOPS 重大訊息")
 async def scrape_mops_data(req: MopsRequest):
     """
-    啟動 Playwright 瀏覽器，前往公開資訊觀測站，
-    並以安全的方式逐一抓取每家公司的重大訊息詳細內容。
+    啟動 Playwright 瀏覽器，前往指定的 MOPS URL，
+    並以安全的方式逐一抓取公司的重大訊息詳細內容。
     """
     start_time = datetime.now()
-    logger.info(f"接收到爬取請求 (併發數: {req.max_concurrent}, 限制: {req.limit or '無'})...")
-    
-    url = "https://mops.twse.com.tw/mops/web/t05sr01_1"
+    logger.info(f"接收到爬取請求 -> URL: {req.url}")
+    logger.info(f"設定 -> 併發數: {req.max_concurrent}, 限制: {req.limit or '無'}")
     
     async with async_playwright() as p:
         try:
-            browser = await p.chromium.launch(headless=True)
+            # 在容器環境中運行 Playwright 需要額外的參數
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
             page = await context.new_page()
             
-            logger.info(f"正在導航至: {url}")
-            await page.goto(url, timeout=60000, wait_until='domcontentloaded')
+            logger.info(f"正在導航至: {req.url}")
+            await page.goto(str(req.url), timeout=60000, wait_until='domcontentloaded')
             
-            logger.info("頁面載入完成，等待表格元素出現...")
-            await page.wait_for_selector('table.hasBorder', timeout=30000)
+            # --- 【關鍵修正】---
+            # 智慧判斷是否需要點擊「查詢」按鈕
+            if "t05sr01_1" in str(req.url):
+                logger.info("偵測到為「當日資料」頁面，點擊「查詢」按鈕以載入資料...")
+                query_button = page.locator('input[type="button"][value=" 查 詢 "]')
+                await query_button.click(timeout=15000)
+            else:
+                logger.info("偵測到為「歷史資料」或特定日期頁面，將直接等待資料載入...")
+
+            # 統一等待結果表格出現，表示資料已載入
+            logger.info("等待查詢結果載入...")
+            await page.wait_for_selector('table.hasBorder', timeout=45000)
+            await page.wait_for_load_state('networkidle', timeout=45000)
+            logger.info("查詢結果表格已成功載入。")
+            # --- 【修正結束】---
             
-            # 【核心修正】定位所有包含「查看」按鈕的資料列
+            # 定位所有包含「查看」按鈕的資料列
             rows_with_button = page.locator('table.hasBorder > tbody > tr:has(input[type="button"]:has-text("查看"))')
             row_count = await rows_with_button.count()
             
@@ -198,8 +220,8 @@ async def scrape_mops_data(req: MopsRequest):
             results = await asyncio.gather(*tasks)
             
         except PlaywrightTimeoutError as e:
-            logger.error(f"導航或尋找表格時發生超時錯誤: {e}")
-            raise HTTPException(status_code=504, detail="頁面載入或元素定位超時")
+            logger.error(f"導航、點擊查詢或尋找表格時發生超時錯誤: {e}")
+            raise HTTPException(status_code=504, detail=f"頁面操作超時: {e}")
         except Exception as e:
             logger.error(f"爬取過程中發生嚴重錯誤: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
@@ -227,11 +249,12 @@ async def scrape_mops_data(req: MopsRequest):
 # --- 健康檢查 ---
 @app.get("/healthz", summary="健康檢查")
 def healthz():
-    return {"status": "ok", "version": "2.0.0-fixed"}
+    return {"status": "ok", "version": "2.2.0-flexible"}
 
 # --- 程式進入點 ---
 if __name__ == "__main__":
+    # 為了在 Zeabur 等平台上正確運行，必須從環境變數讀取 PORT
     # 使用 uvicorn 啟動 FastAPI 應用程式
-    # 在終端機中運行 `python mops_crawler_fixed.py` 即可啟動
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000)) # 從環境變數讀取，若無則預設 8000
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
