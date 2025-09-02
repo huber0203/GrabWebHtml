@@ -6,7 +6,7 @@ import sys
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from playwright.async_api import async_playwright, Locator, TimeoutError as PlaywrightTimeoutError
 import uvicorn
 
