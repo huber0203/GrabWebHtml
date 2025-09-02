@@ -302,14 +302,21 @@ async def process_new_version_row(row_locator: Locator, index: int, clean_html: 
                     # 特殊處理：瀏覽器或頁面已關閉的錯誤
                     if "closed" in error_msg.lower():
                         logger.error(f"  -> Index {index} [{base_info['code']} {base_info['company']}] 瀏覽器已關閉: {error_msg[:100]}")
-                        base_info["detail"] = Detail(
-                            html="", fetched=False, 
-                            fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(),
-                            retry_count=attempt, error="Browser closed"
-                        )
-                        return CompanyInfo(**base_info)  # 不再重試
+                        # 如果還有重試機會，繼續重試
+                        if attempt < max_retries - 1:
+                            logger.info(f"  -> Index {index} 將在 2 秒後重試...")
+                            await asyncio.sleep(2)
+                            continue
+                        else:
+                            # 最後一次重試也失敗了
+                            base_info["detail"] = Detail(
+                                html="", fetched=False, 
+                                fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(),
+                                retry_count=attempt, error="Browser closed after all retries"
+                            )
+                            return CompanyInfo(**base_info)
                     
-                    logger.warning(f"  -> Index {index} 失敗: {error_msg[:100]}")
+                    logger.warning(f"  -> Index {index} [{base_info['code']} {base_info['company']}] 失敗: {error_msg[:100]}")
                     if attempt == max_retries - 1:
                         # 最後一次嘗試失敗
                         base_info["detail"] = Detail(
