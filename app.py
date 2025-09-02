@@ -132,7 +132,9 @@ async def process_old_version_row(row_locator: Locator, index: int, clean_html: 
         page = row_locator.page
         context = page.context
         
-        max_retries = 3
+        # 記錄實際使用的重試次數
+        logger.debug(f"  Index {index} 使用 max_retries={max_retries}")
+        
         for attempt in range(max_retries):
             detail_start_time = datetime.now()
             try:
@@ -268,7 +270,9 @@ async def process_new_version_row(row_locator: Locator, index: int, clean_html: 
             page = row_locator.page
             context = page.context
             
-            max_retries = 3
+            # 記錄實際使用的重試次數
+            logger.debug(f"  Index {index} 使用 max_retries={max_retries}")
+            
             for attempt in range(max_retries):
                 detail_start_time = datetime.now()
                 try:
