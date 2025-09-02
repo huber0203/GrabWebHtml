@@ -3,16 +3,17 @@
 import asyncio
 import logging
 import sys
-import os # 匯入 os 模組以讀取環境變數
+import os
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, AnyHttpUrl
 from playwright.async_api import async_playwright, Locator, TimeoutError as PlaywrightTimeoutError
 import uvicorn
+from bs4 import BeautifulSoup
+import re
 
 # --- Logging 設定 ---
-# 設定日誌記錄，方便追蹤程式運行狀況
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -22,14 +23,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Pydantic 模型定義 (用於 API 回應) ---
-# 定義 API 回應的資料結構，確保格式一致
+# --- Pydantic 模型定義 ---
 class Detail(BaseModel):
     html: str
     fetched: bool
     fetch_time_seconds: float
     retry_count: int
     error: Optional[str] = None
+    page_type: Optional[str] = None  # 新增：標記是 alert 還是新視窗
 
 class CompanyInfo(BaseModel):
     index: int
@@ -49,20 +50,63 @@ class ScrapeResponse(BaseModel):
     total_time_seconds: float
     data: List[CompanyInfo]
     timestamp: datetime
+    page_version: str  # 新增：標記頁面版本
 
-# --- FastAPI 應用程式實例 ---
+# --- HTML 清理函式 ---
+def clean_html_content(html_content: str) -> str:
+    """清理 HTML，移除不必要的標籤和屬性"""
+    if not html_content:
+        return ""
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # 移除所有 script 和 style 標籤
+        for tag in soup.find_all(['script', 'style']):
+            tag.decompose()
+        
+        # 嘗試找到核心內容區塊
+        core_content = soup.find('div', id='queryResults') or soup.find('div', class_='content-area')
+        if core_content:
+            return str(core_content)
+        else:
+            body_content = soup.find('body')
+            return str(body_content) if body_content else html_content
+            
+    except Exception as e:
+        logger.error(f"HTML 清理失敗: {e}")
+        return html_content
+
+# --- FastAPI 應用程式 ---
 app = FastAPI(
-    title="MOPS 公開資訊觀測站爬蟲 API (修正版)",
-    description="採用原子化操作，從根本解決資料錯位問題的非同步 MOPS 爬蟲程式。"
+    title="MOPS 通用爬蟲 API",
+    description="支援新舊版 MOPS 頁面的智慧爬蟲"
 )
 
-# --- 核心爬蟲邏輯 (已重構) ---
+# --- 頁面版本偵測 ---
+async def detect_page_version(page) -> str:
+    """偵測是新版還是舊版 MOPS 頁面"""
+    url = page.url
+    
+    # 檢查 URL 模式
+    if "#/web/" in url:
+        return "new"
+    elif "/mops/web/" in url:
+        return "old"
+    
+    # 如果 URL 無法判斷，檢查頁面結構
+    try:
+        # 新版通常有 Vue/React 的 #app 或類似結構
+        has_app = await page.locator('#app').count() > 0
+        if has_app:
+            return "new"
+    except:
+        pass
+    
+    return "old"  # 預設為舊版
 
-async def process_single_row(row_locator: Locator, index: int) -> CompanyInfo:
-    """
-    【核心修正】處理單一表格列，以原子化操作抓取資料與詳細HTML。
-    此函數確保了資料提取和按鈕點擊都在同一 `row` 元素內完成，杜絕了資料錯位的可能。
-    """
+# --- 處理舊版頁面的單一列 ---
+async def process_old_version_row(row_locator: Locator, index: int, clean_html: bool) -> CompanyInfo:
+    """處理舊版 MOPS 頁面的單一表格列"""
     base_info = {
         "index": index,
         "date": "N/A", "time": "N/A", "code": "N/A", 
@@ -70,199 +114,321 @@ async def process_single_row(row_locator: Locator, index: int) -> CompanyInfo:
     }
 
     try:
-        # 1. 在 `row_locator` 的範圍內，提取表格中的基本資料
-        base_info["date"] = await row_locator.locator('td').nth(0).inner_text()
-        base_info["time"] = await row_locator.locator('td').nth(1).inner_text()
-        base_info["code"] = await row_locator.locator('td').nth(2).inner_text()
-        base_info["company"] = await row_locator.locator('td').nth(3).inner_text()
-        base_info["subject"] = (await row_locator.locator('td').nth(4).inner_text()).replace('\r\n', ' ').strip()
+        # 提取基本資料
+        cells = row_locator.locator('td')
+        base_info["date"] = await cells.nth(0).inner_text()
+        base_info["time"] = await cells.nth(1).inner_text()
+        base_info["code"] = await cells.nth(2).inner_text()
+        base_info["company"] = await cells.nth(3).inner_text()
+        base_info["subject"] = (await cells.nth(4).inner_text()).replace('\r\n', ' ').strip()
         base_info["hasDetail"] = True
 
         logger.info(f"處理中 (Index {index}): {base_info['code']} {base_info['company']}")
 
-        # 2. 在 `row_locator` 的範圍內，找到並點擊「查看」按鈕
-        view_button = row_locator.locator('input[type="button"]:has-text("查看")')
+        # 找到並點擊「查看」按鈕
+        view_button = row_locator.locator('input[type="button"][value*="查看"], button:has-text("查看")')
         page = row_locator.page
         context = page.context
         
-        # 3. 執行點擊並等待新視窗
         max_retries = 3
         for attempt in range(max_retries):
             detail_start_time = datetime.now()
             try:
-                async with context.expect_page(timeout=20000) as page_info:
-                    await view_button.click(timeout=15000)
+                # 嘗試捕獲新視窗
+                async with context.expect_page(timeout=15000) as page_info:
+                    await view_button.click(timeout=10000)
                 
                 detail_page = await page_info.value
-                
-                # 在新分頁中等待並抓取內容
                 await detail_page.wait_for_load_state("domcontentloaded", timeout=20000)
                 detail_html = await detail_page.content()
                 await detail_page.close()
                 
                 fetch_time = (datetime.now() - detail_start_time).total_seconds()
-                logger.info(f"  -> Index {index} 成功, 耗時: {fetch_time:.2f}s")
-
+                
+                if clean_html:
+                    detail_html = clean_html_content(detail_html)
+                
+                logger.info(f"  -> Index {index} 成功 (新視窗), 耗時: {fetch_time:.2f}s")
+                
                 base_info["detail"] = Detail(
                     html=detail_html,
                     fetched=True,
                     fetch_time_seconds=fetch_time,
-                    retry_count=attempt
+                    retry_count=attempt,
+                    page_type="new_window"
                 )
                 return CompanyInfo(**base_info)
 
-            except PlaywrightTimeoutError as e:
-                logger.warning(f"  -> Index {index} 第 {attempt + 1}/{max_retries} 次嘗試超時: {str(e)}")
-                if attempt == max_retries - 1:
-                    raise  # 最後一次重試失敗，拋出異常
-                await asyncio.sleep(2) # 等待後重試
+            except PlaywrightTimeoutError:
+                # 可能是 alert 而非新視窗
+                try:
+                    # 檢查是否有 alert
+                    await page.wait_for_timeout(1000)  # 短暫等待
+                    
+                    # 嘗試接受 alert
+                    page.on("dialog", lambda dialog: dialog.accept())
+                    
+                    logger.info(f"  -> Index {index} 可能是 alert 類型")
+                    base_info["detail"] = Detail(
+                        html="",
+                        fetched=True,
+                        fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(),
+                        retry_count=attempt,
+                        page_type="alert"
+                    )
+                    return CompanyInfo(**base_info)
+                    
+                except Exception:
+                    if attempt == max_retries - 1:
+                        raise
+                    await asyncio.sleep(2)
+                    
             except Exception as e:
-                logger.error(f"  -> Index {index} 發生非預期錯誤: {e}")
+                logger.error(f"  -> Index {index} 發生錯誤: {e}")
                 base_info["detail"] = Detail(
                     html="", fetched=False, fetch_time_seconds=0, 
-                    retry_count=attempt, error=f"Unexpected error: {str(e)}"
+                    retry_count=attempt, error=str(e)
                 )
                 return CompanyInfo(**base_info)
 
     except Exception as e:
-        error_message = f"處理 Index {index} 最終失敗: {str(e)}"
-        logger.error(error_message)
+        logger.error(f"處理 Index {index} 失敗: {e}")
         base_info["detail"] = Detail(
             html="", fetched=False, fetch_time_seconds=0, 
-            retry_count=max_retries if 'max_retries' in locals() else 0, 
-            error=error_message
+            retry_count=0, error=str(e)
         )
     
     return CompanyInfo(**base_info)
 
-
-# --- FastAPI 端點 (Endpoint) ---
-
-@app.get("/", summary="API 根目錄")
-async def root():
-    """提供 API 的基本資訊"""
-    return {
-        "message": "歡迎使用修正版的 MOPS 公開資訊觀測站爬蟲 API",
-        "usage": "請使用 POST 方法訪問 /scrape-mops 來開始抓取資料"
+# --- 處理新版頁面的單一列 ---
+async def process_new_version_row(row_locator: Locator, index: int, clean_html: bool) -> CompanyInfo:
+    """處理新版 MOPS 頁面的單一表格列"""
+    base_info = {
+        "index": index,
+        "date": "N/A", "time": "N/A", "code": "N/A", 
+        "company": f"Unknown_{index}", "subject": "N/A", "hasDetail": False
     }
 
+    try:
+        # 新版頁面可能使用不同的標籤結構
+        cells = row_locator.locator('td, .cell, .table-cell')
+        cell_count = await cells.count()
+        
+        if cell_count >= 5:
+            base_info["date"] = await cells.nth(0).inner_text()
+            base_info["time"] = await cells.nth(1).inner_text()
+            base_info["code"] = await cells.nth(2).inner_text()
+            base_info["company"] = await cells.nth(3).inner_text()
+            base_info["subject"] = (await cells.nth(4).inner_text()).replace('\r\n', ' ').strip()
+            base_info["hasDetail"] = True
+
+        logger.info(f"處理中 (Index {index}): {base_info['code']} {base_info['company']}")
+
+        # 新版可能使用 button 而非 input
+        view_button = row_locator.locator('button:has-text("查看"), input[value*="查看"], a:has-text("查看")')
+        
+        if await view_button.count() > 0:
+            page = row_locator.page
+            context = page.context
+            
+            detail_start_time = datetime.now()
+            try:
+                # 新版可能使用 SPA 導航或新視窗
+                async with context.expect_page(timeout=15000) as page_info:
+                    await view_button.click(timeout=10000)
+                
+                detail_page = await page_info.value
+                await detail_page.wait_for_load_state("networkidle", timeout=30000)
+                detail_html = await detail_page.content()
+                await detail_page.close()
+                
+                fetch_time = (datetime.now() - detail_start_time).total_seconds()
+                
+                if clean_html:
+                    detail_html = clean_html_content(detail_html)
+                
+                logger.info(f"  -> Index {index} 成功, 耗時: {fetch_time:.2f}s")
+                
+                base_info["detail"] = Detail(
+                    html=detail_html,
+                    fetched=True,
+                    fetch_time_seconds=fetch_time,
+                    retry_count=0,
+                    page_type="new_window"
+                )
+                
+            except Exception as e:
+                logger.warning(f"  -> Index {index} 詳細資料取得失敗: {e}")
+                base_info["detail"] = Detail(
+                    html="", fetched=False, fetch_time_seconds=0, 
+                    retry_count=0, error=str(e)
+                )
+
+    except Exception as e:
+        logger.error(f"處理 Index {index} 失敗: {e}")
+        base_info["detail"] = Detail(
+            html="", fetched=False, fetch_time_seconds=0, 
+            retry_count=0, error=str(e)
+        )
+    
+    return CompanyInfo(**base_info)
+
+# --- 主要 API 端點 ---
 class MopsRequest(BaseModel):
-    # 【修正】新增 url 欄位，並給予預設值
     url: AnyHttpUrl = Field(
         "https://mops.twse.com.tw/mops/web/t05sr01_1", 
-        description="要抓取的目標 MOPS 頁面 URL。預設為當日重大訊息。"
+        description="要抓取的 MOPS 頁面 URL"
     )
-    max_concurrent: int = Field(5, description="最大同時處理的併發任務數量", ge=1, le=20)
-    limit: Optional[int] = Field(None, description="限制處理的資料筆數，用於測試", ge=1)
+    max_concurrent: int = Field(5, description="最大併發數", ge=1, le=20)
+    limit: Optional[int] = Field(None, description="限制處理筆數", ge=1)
+    clean_html: bool = Field(False, description="是否清理 HTML")
+    wait_time: int = Field(5, description="新版頁面額外等待時間（秒）", ge=0, le=30)
 
-@app.post("/scrape-mops", response_model=ScrapeResponse, summary="抓取 MOPS 重大訊息")
+@app.post("/scrape-mops", response_model=ScrapeResponse)
 async def scrape_mops_data(req: MopsRequest):
-    """
-    啟動 Playwright 瀏覽器，前往指定的 MOPS URL，
-    並以安全的方式逐一抓取公司的重大訊息詳細內容。
-    """
+    """智慧抓取 MOPS 資料，自動偵測並處理新舊版頁面"""
     start_time = datetime.now()
-    logger.info(f"接收到爬取請求 -> URL: {req.url}")
-    logger.info(f"設定 -> 併發數: {req.max_concurrent}, 限制: {req.limit or '無'}")
+    logger.info(f"開始爬取: {req.url}")
+    logger.info(f"設定: 併發={req.max_concurrent}, 限制={req.limit}, 清理HTML={req.clean_html}")
     
     async with async_playwright() as p:
         try:
-            # 在容器環境中運行 Playwright 需要額外的參數
             browser = await p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"]
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
             )
             context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080}
             )
             page = await context.new_page()
             
-            logger.info(f"正在導航至: {req.url}")
+            # 導航到頁面
+            logger.info(f"導航至: {req.url}")
             await page.goto(str(req.url), timeout=60000, wait_until='domcontentloaded')
             
-            # --- 【最終關鍵修正】---
-            # 智慧判斷是否需要點擊「查詢」按鈕
-            if "t05sr01_1" in str(req.url):
-                logger.info("偵測到為「當日資料」頁面，點擊「查詢」按鈕...")
-                async with page.expect_response("**/ajax_t05sr01_1", timeout=60000) as response_info:
-                    await page.locator('input[type="button"][value=" 查 詢 "]').click(timeout=15000)
-                response = await response_info.value
-                logger.info(f"背景資料 API (ajax_t05sr01_1) 載入完成，狀態: {response.status}")
-            else:
-                logger.info("偵測到為「歷史資料」頁面，等待表格出現...")
-                # 對於歷史資料頁面，直接等待第一行資料出現即可
-                await page.locator('table.hasBorder > tbody > tr').first.wait_for(timeout=60000)
+            # 偵測頁面版本
+            page_version = await detect_page_version(page)
+            logger.info(f"偵測到頁面版本: {page_version}")
             
-            logger.info("查詢結果表格已成功載入。")
-            # --- 【修正結束】---
+            # 根據版本執行不同的等待策略
+            if page_version == "new":
+                # 新版頁面需要更多時間載入
+                logger.info(f"新版頁面，額外等待 {req.wait_time} 秒...")
+                await page.wait_for_timeout(req.wait_time * 1000)
+                
+                # 嘗試多種可能的表格選擇器
+                possible_selectors = [
+                    'table tbody tr:has(button:has-text("查看"))',
+                    'div.table-container tr:has(button)',
+                    '.data-table tbody tr',
+                    'table tr:has(td)',
+                    '[role="table"] [role="row"]:has(button)'
+                ]
+                
+                rows_locator = None
+                for selector in possible_selectors:
+                    try:
+                        temp_locator = page.locator(selector)
+                        if await temp_locator.count() > 0:
+                            rows_locator = temp_locator
+                            logger.info(f"找到資料使用選擇器: {selector}")
+                            break
+                    except:
+                        continue
+                
+                if not rows_locator:
+                    logger.warning("無法找到資料列，嘗試通用選擇器...")
+                    rows_locator = page.locator('tr:has(td)')
+                    
+            else:  # old version
+                # 舊版頁面處理
+                if "t05sr01_1" in str(req.url):
+                    logger.info("當日資料頁面，點擊查詢...")
+                    try:
+                        async with page.expect_response("**/ajax_t05sr01_1", timeout=60000) as response_info:
+                            await page.locator('input[type="button"][value*="查詢"]').click(timeout=15000)
+                        response = await response_info.value
+                        logger.info(f"資料載入完成，狀態: {response.status}")
+                    except:
+                        logger.warning("查詢按鈕點擊失敗，繼續處理...")
+                
+                # 等待表格出現
+                await page.locator('table').first.wait_for(timeout=30000)
+                rows_locator = page.locator('table.hasBorder > tbody > tr:has(input[value*="查看"])')
             
-            # 定位所有包含「查看」按鈕的資料列
-            rows_with_button = page.locator('table.hasBorder > tbody > tr:has(input[type="button"]:has-text("查看"))')
-            row_count = await rows_with_button.count()
+            # 計算要處理的資料筆數
+            row_count = await rows_locator.count()
+            process_count = min(row_count, req.limit) if req.limit else row_count
+            logger.info(f"找到 {row_count} 筆資料，將處理 {process_count} 筆")
             
-            # 應用 limit 限制
-            process_count = min(row_count, req.limit) if req.limit is not None else row_count
-            logger.info(f"找到 {row_count} 筆可處理的資料，將處理其中 {process_count} 筆...")
-
             if process_count == 0:
-                logger.warning("在頁面上未找到任何可處理的資料列。")
                 await browser.close()
                 return ScrapeResponse(
-                    success=True, total_records=0, successful_details=0, failed_details=0, 
-                    total_time_seconds=0, data=[], timestamp=datetime.now()
+                    success=True, total_records=0, successful_details=0, 
+                    failed_details=0, total_time_seconds=0, data=[], 
+                    timestamp=datetime.now(), page_version=page_version
                 )
-
-            # 建立非同步任務列表
+            
+            # 建立併發任務
             semaphore = asyncio.Semaphore(req.max_concurrent)
             
-            async def semaphore_task_wrapper(row_locator, index):
+            async def process_with_semaphore(row_locator, index):
                 async with semaphore:
-                    return await process_single_row(row_locator, index)
+                    if page_version == "new":
+                        return await process_new_version_row(row_locator, index, req.clean_html)
+                    else:
+                        return await process_old_version_row(row_locator, index, req.clean_html)
             
             tasks = [
-                semaphore_task_wrapper(rows_with_button.nth(i), i) 
+                process_with_semaphore(rows_locator.nth(i), i) 
                 for i in range(process_count)
             ]
             
-            # 平行執行所有任務
+            # 執行所有任務
             results = await asyncio.gather(*tasks)
             
-        except PlaywrightTimeoutError as e:
-            logger.error(f"導航、點擊查詢或尋找表格時發生超時錯誤: {e}")
-            raise HTTPException(status_code=504, detail=f"頁面操作超時: {e}")
         except Exception as e:
-            logger.error(f"爬取過程中發生嚴重錯誤: {e}", exc_info=True)
+            logger.error(f"爬取失敗: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
         finally:
-            if 'browser' in locals() and browser.is_connected():
+            if 'browser' in locals():
                 await browser.close()
-                logger.info("瀏覽器已關閉。")
-
+                logger.info("瀏覽器已關閉")
+    
+    # 統計結果
     total_time = (datetime.now() - start_time).total_seconds()
-    successful_count = sum(1 for r in results if r.detail and r.detail.fetched)
-    failed_count = len(results) - successful_count
-
-    logger.info(f"所有資料處理完成！成功: {successful_count}, 失敗: {failed_count}, 總耗時: {total_time:.2f}s")
-
+    successful = sum(1 for r in results if r.detail and r.detail.fetched)
+    failed = len(results) - successful
+    
+    logger.info(f"完成！成功: {successful}, 失敗: {failed}, 耗時: {total_time:.2f}s")
+    
     return ScrapeResponse(
         success=True,
         total_records=len(results),
-        successful_details=successful_count,
-        failed_details=failed_count,
+        successful_details=successful,
+        failed_details=failed,
         total_time_seconds=total_time,
         data=results,
-        timestamp=datetime.now()
+        timestamp=datetime.now(),
+        page_version=page_version
     )
 
-# --- 健康檢查 ---
-@app.get("/healthz", summary="健康檢查")
+@app.get("/")
+async def root():
+    return {
+        "message": "MOPS 通用爬蟲 API",
+        "version": "3.0.0",
+        "endpoints": {
+            "/scrape-mops": "POST - 抓取 MOPS 資料",
+            "/healthz": "GET - 健康檢查"
+        }
+    }
+
+@app.get("/healthz")
 def healthz():
-    return {"status": "ok", "version": "2.4.0-final"}
+    return {"status": "ok", "version": "3.0.0"}
 
-# --- 程式進入點 ---
 if __name__ == "__main__":
-    # 為了在 Zeabur 等平台上正確運行，必須從環境變數讀取 PORT
-    # 使用 uvicorn 啟動 FastAPI 應用程式
-    port = int(os.environ.get("PORT", 8000)) # 從環境變數讀取，若無則預設 8000
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
