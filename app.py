@@ -467,6 +467,9 @@ async def scrape_mops_data(req: MopsRequest):
                     else:
                         return await process_old_version_row(row_locator, index, req.clean_html, req.max_retries)
             
+            # 在建立任務前記錄設定
+            logger.info(f"使用設定: max_retries={req.max_retries}, max_concurrent={req.max_concurrent}")
+            
             tasks = [
                 process_with_semaphore(rows_locator.nth(i), i) 
                 for i in range(process_count)
