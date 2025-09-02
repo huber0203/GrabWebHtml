@@ -106,7 +106,7 @@ async def detect_page_version(page) -> str:
 
 # --- 處理舊版頁面的單一列 ---
 async def process_old_version_row(row_locator: Locator, index: int, clean_html: bool) -> CompanyInfo:
-    """處理舊版 MOPS 頁面的單一表格列"""
+    """處理舊版 MOPS 頁面的單一表格列（含重試機制）"""
     base_info = {
         "index": index,
         "date": "N/A", "time": "N/A", "code": "N/A", 
@@ -123,7 +123,9 @@ async def process_old_version_row(row_locator: Locator, index: int, clean_html: 
         base_info["subject"] = (await cells.nth(4).inner_text()).replace('\r\n', ' ').strip()
         base_info["hasDetail"] = True
 
-        logger.info(f"處理中 (Index {index}): {base_info['code']} {base_info['company']}")
+        # 準備標題預覽（限制長度）
+        subject_preview = base_info['subject'][:50] + "..." if len(base_info['subject']) > 50 else base_info['subject']
+        logger.info(f"處理中 (Index {index}): {base_info['date']} {base_info['time']} {base_info['code']} {base_info['company']} - {subject_preview}")
 
         # 找到並點擊「查看」按鈕
         view_button = row_locator.locator('input[type="button"][value*="查看"], button:has-text("查看")')
@@ -134,6 +136,10 @@ async def process_old_version_row(row_locator: Locator, index: int, clean_html: 
         for attempt in range(max_retries):
             detail_start_time = datetime.now()
             try:
+                if attempt > 0:
+                    logger.info(f"  -> Index {index} 重試 {attempt}/{max_retries-1}")
+                    await asyncio.sleep(2)  # 重試前等待
+                
                 # 嘗試捕獲新視窗
                 async with context.expect_page(timeout=15000) as page_info:
                     await view_button.click(timeout=10000)
@@ -148,7 +154,8 @@ async def process_old_version_row(row_locator: Locator, index: int, clean_html: 
                 if clean_html:
                     detail_html = clean_html_content(detail_html)
                 
-                logger.info(f"  -> Index {index} 成功 (新視窗), 耗時: {fetch_time:.2f}s")
+                logger.info(f"  -> Index {index} [{base_info['code']} {base_info['company']}] 成功 (新視窗), 耗時: {fetch_time:.2f}s" +
+                           (f" (重試 {attempt} 次)" if attempt > 0 else ""))
                 
                 base_info["detail"] = Detail(
                     html=detail_html,
@@ -157,18 +164,15 @@ async def process_old_version_row(row_locator: Locator, index: int, clean_html: 
                     retry_count=attempt,
                     page_type="new_window"
                 )
-                return CompanyInfo(**base_info)
+                return CompanyInfo(**base_info)  # 成功後立即返回
 
             except PlaywrightTimeoutError:
                 # 可能是 alert 而非新視窗
                 try:
-                    # 檢查是否有 alert
-                    await page.wait_for_timeout(1000)  # 短暫等待
-                    
-                    # 嘗試接受 alert
+                    await page.wait_for_timeout(1000)
                     page.on("dialog", lambda dialog: dialog.accept())
                     
-                    logger.info(f"  -> Index {index} 可能是 alert 類型")
+                    logger.info(f"  -> Index {index} 是 alert 類型")
                     base_info["detail"] = Detail(
                         html="",
                         fetched=True,
@@ -180,19 +184,36 @@ async def process_old_version_row(row_locator: Locator, index: int, clean_html: 
                     
                 except Exception:
                     if attempt == max_retries - 1:
-                        raise
-                    await asyncio.sleep(2)
+                        logger.error(f"  -> Index {index} 最終失敗（超時）")
+                        base_info["detail"] = Detail(
+                            html="", fetched=False,
+                            fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(),
+                            retry_count=attempt, error="Timeout after retries"
+                        )
                     
             except Exception as e:
-                logger.error(f"  -> Index {index} 發生錯誤: {e}")
-                base_info["detail"] = Detail(
-                    html="", fetched=False, fetch_time_seconds=0, 
-                    retry_count=attempt, error=str(e)
-                )
-                return CompanyInfo(**base_info)
+                error_msg = str(e)
+                
+                # 特殊處理：瀏覽器或頁面已關閉
+                if "closed" in error_msg.lower():
+                    logger.error(f"  -> Index {index} 瀏覽器已關閉: {error_msg[:100]}")
+                    base_info["detail"] = Detail(
+                        html="", fetched=False,
+                        fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(),
+                        retry_count=attempt, error="Browser closed"
+                    )
+                    return CompanyInfo(**base_info)  # 不再重試
+                
+                logger.error(f"  -> Index {index} 發生錯誤: {error_msg[:100]}")
+                if attempt == max_retries - 1:
+                    base_info["detail"] = Detail(
+                        html="", fetched=False,
+                        fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(),
+                        retry_count=attempt, error=error_msg
+                    )
 
     except Exception as e:
-        logger.error(f"處理 Index {index} 失敗: {e}")
+        logger.error(f"處理 Index {index} 基本資料失敗: {e}")
         base_info["detail"] = Detail(
             html="", fetched=False, fetch_time_seconds=0, 
             retry_count=0, error=str(e)
@@ -202,7 +223,7 @@ async def process_old_version_row(row_locator: Locator, index: int, clean_html: 
 
 # --- 處理新版頁面的單一列 ---
 async def process_new_version_row(row_locator: Locator, index: int, clean_html: bool) -> CompanyInfo:
-    """處理新版 MOPS 頁面的單一表格列"""
+    """處理新版 MOPS 頁面的單一表格列（含重試機制）"""
     base_info = {
         "index": index,
         "date": "N/A", "time": "N/A", "code": "N/A", 
@@ -231,41 +252,81 @@ async def process_new_version_row(row_locator: Locator, index: int, clean_html: 
             page = row_locator.page
             context = page.context
             
-            detail_start_time = datetime.now()
-            try:
-                # 新版可能使用 SPA 導航或新視窗
-                async with context.expect_page(timeout=15000) as page_info:
-                    await view_button.click(timeout=10000)
-                
-                detail_page = await page_info.value
-                await detail_page.wait_for_load_state("networkidle", timeout=30000)
-                detail_html = await detail_page.content()
-                await detail_page.close()
-                
-                fetch_time = (datetime.now() - detail_start_time).total_seconds()
-                
-                if clean_html:
-                    detail_html = clean_html_content(detail_html)
-                
-                logger.info(f"  -> Index {index} 成功, 耗時: {fetch_time:.2f}s")
-                
-                base_info["detail"] = Detail(
-                    html=detail_html,
-                    fetched=True,
-                    fetch_time_seconds=fetch_time,
-                    retry_count=0,
-                    page_type="new_window"
-                )
-                
-            except Exception as e:
-                logger.warning(f"  -> Index {index} 詳細資料取得失敗: {e}")
-                base_info["detail"] = Detail(
-                    html="", fetched=False, fetch_time_seconds=0, 
-                    retry_count=0, error=str(e)
-                )
+            max_retries = 3
+            for attempt in range(max_retries):
+                detail_start_time = datetime.now()
+                try:
+                    if attempt > 0:
+                        logger.info(f"  -> Index {index} 重試 {attempt}/{max_retries-1}")
+                        await asyncio.sleep(2)  # 重試前等待
+                    
+                    # 新版可能使用 SPA 導航或新視窗
+                    async with context.expect_page(timeout=15000) as page_info:
+                        await view_button.click(timeout=10000)
+                    
+                    detail_page = await page_info.value
+                    await detail_page.wait_for_load_state("networkidle", timeout=30000)
+                    detail_html = await detail_page.content()
+                    await detail_page.close()
+                    
+                    fetch_time = (datetime.now() - detail_start_time).total_seconds()
+                    
+                    if clean_html:
+                        detail_html = clean_html_content(detail_html)
+                    
+                    logger.info(f"  -> Index {index} 成功, 耗時: {fetch_time:.2f}s" + 
+                               (f" (重試 {attempt} 次)" if attempt > 0 else ""))
+                    
+                    base_info["detail"] = Detail(
+                        html=detail_html,
+                        fetched=True,
+                        fetch_time_seconds=fetch_time,
+                        retry_count=attempt,
+                        page_type="new_window"
+                    )
+                    return CompanyInfo(**base_info)  # 成功後立即返回
+                    
+                except PlaywrightTimeoutError as e:
+                    logger.warning(f"  -> Index {index} [{base_info['code']} {base_info['company']}] 超時: {str(e)[:100]}")
+                    if attempt == max_retries - 1:
+                        # 最後一次嘗試失敗
+                        base_info["detail"] = Detail(
+                            html="", fetched=False, 
+                            fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(), 
+                            retry_count=attempt, error=f"Timeout after {max_retries} attempts"
+                        )
+                        
+                except Exception as e:
+                    error_msg = str(e)
+                    
+                    # 特殊處理：瀏覽器或頁面已關閉的錯誤
+                    if "closed" in error_msg.lower():
+                        logger.error(f"  -> Index {index} [{base_info['code']} {base_info['company']}] 瀏覽器已關閉: {error_msg[:100]}")
+                        base_info["detail"] = Detail(
+                            html="", fetched=False, 
+                            fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(),
+                            retry_count=attempt, error="Browser closed"
+                        )
+                        return CompanyInfo(**base_info)  # 不再重試
+                    
+                    logger.warning(f"  -> Index {index} 失敗: {error_msg[:100]}")
+                    if attempt == max_retries - 1:
+                        # 最後一次嘗試失敗
+                        base_info["detail"] = Detail(
+                            html="", fetched=False,
+                            fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(),
+                            retry_count=attempt, error=error_msg
+                        )
+        else:
+            # 沒有找到查看按鈕
+            logger.info(f"  -> Index {index} 沒有詳細資料按鈕")
+            base_info["detail"] = Detail(
+                html="", fetched=False, fetch_time_seconds=0,
+                retry_count=0, error="No view button found"
+            )
 
     except Exception as e:
-        logger.error(f"處理 Index {index} 失敗: {e}")
+        logger.error(f"處理 Index {index} 基本資料失敗: {e}")
         base_info["detail"] = Detail(
             html="", fetched=False, fetch_time_seconds=0, 
             retry_count=0, error=str(e)
@@ -283,6 +344,7 @@ class MopsRequest(BaseModel):
     limit: Optional[int] = Field(None, description="限制處理筆數", ge=1)
     clean_html: bool = Field(False, description="是否清理 HTML")
     wait_time: int = Field(5, description="新版頁面額外等待時間（秒）", ge=0, le=30)
+    max_retries: int = Field(3, description="失敗重試次數", ge=1, le=10)
 
 @app.post("/scrape-mops", response_model=ScrapeResponse)
 async def scrape_mops_data(req: MopsRequest):
