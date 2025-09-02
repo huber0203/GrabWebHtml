@@ -186,13 +186,14 @@ async def scrape_mops_data(req: MopsRequest):
                 logger.info("偵測到為「當日資料」頁面，點擊「查詢」按鈕以載入資料...")
                 query_button = page.locator('input[type="button"][value=" 查 詢 "]')
                 await query_button.click(timeout=15000)
+                # 點擊後短暫等待，讓網路請求有時間發出
+                await asyncio.sleep(1)
             else:
                 logger.info("偵測到為「歷史資料」或特定日期頁面，將直接等待資料載入...")
 
-            # 統一等待結果表格出現，表示資料已載入
+            # 【修正】統一等待結果表格的第一列資料出現，這是比 networkidle 更可靠的指標
             logger.info("等待查詢結果載入...")
-            await page.wait_for_selector('table.hasBorder', timeout=45000)
-            await page.wait_for_load_state('networkidle', timeout=45000)
+            await page.locator('table.hasBorder > tbody > tr').first.wait_for(timeout=60000)
             logger.info("查詢結果表格已成功載入。")
             # --- 【修正結束】---
             
@@ -249,7 +250,7 @@ async def scrape_mops_data(req: MopsRequest):
 # --- 健康檢查 ---
 @app.get("/healthz", summary="健康檢查")
 def healthz():
-    return {"status": "ok", "version": "2.2.0-flexible"}
+    return {"status": "ok", "version": "2.3.0-stable-wait"}
 
 # --- 程式進入點 ---
 if __name__ == "__main__":
