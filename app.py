@@ -1,475 +1,237 @@
 # -*- coding: utf-8 -*-
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, AnyHttpUrl
-from typing import Optional, Dict, Any, Literal
-from io import BytesIO
-from urllib.parse import urlparse, quote
-from datetime import datetime
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-from bs4 import BeautifulSoup
-import re
+
+import asyncio
 import logging
 import sys
-import asyncio
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from playwright.async_api import async_playwright, Locator, TimeoutError as PlaywrightTimeoutError
+import uvicorn
 
-app = FastAPI(title="Universal HTML Fetcher", version="1.7.0")
-
-# 設定日誌
+# --- Logging 設定 ---
+# 設定日誌記錄，方便追蹤程式運行狀況
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
+# --- Pydantic 模型定義 (用於 API 回應) ---
+# 定義 API 回應的資料結構，確保格式一致
+class Detail(BaseModel):
+    html: str
+    fetched: bool
+    fetch_time_seconds: float
+    retry_count: int
+    error: Optional[str] = None
 
-# --------------------
-# 共用工具
-# --------------------
-def build_session(user_agent: Optional[str]) -> requests.Session:
-    sess = requests.Session()
-    retry = Retry(
-        total=5,
-        backoff_factor=0.7,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "POST", "OPTIONS"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-    sess.mount("http://", adapter)
-    sess.mount("https://", adapter)
+class CompanyInfo(BaseModel):
+    index: int
+    date: str
+    time: str
+    code: str
+    company: str
+    subject: str
+    hasDetail: bool
+    detail: Optional[Detail] = None
 
-    sess.headers.update({
-        "User-Agent": user_agent or (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "*/*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    })
-    return sess
+class ScrapeResponse(BaseModel):
+    success: bool
+    total_records: int
+    successful_details: int
+    failed_details: int
+    total_time_seconds: float
+    data: List[CompanyInfo]
+    timestamp: datetime
 
-def default_filename(url: str, fallback_ext: str = "html") -> str:
-    p = urlparse(url)
-    base = (p.netloc + p.path).replace("/", "_").strip("_") or "download"
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if "." not in base.split("_")[-1]:
-        base = f"{base}.{fallback_ext}"
-    return f"{base}_{ts}"
+# --- FastAPI 應用程式實例 ---
+app = FastAPI(
+    title="MOPS 公開資訊觀測站爬蟲 API (修正版)",
+    description="採用原子化操作，從根本解決資料錯位問題的非同步 MOPS 爬蟲程式。"
+)
 
+# --- 核心爬蟲邏輯 (已重構) ---
 
-def clean_html_content(html_content: str) -> str:
+async def process_single_row(row_locator: Locator, index: int) -> CompanyInfo:
     """
-    清理 HTML 內容，移除雜訊，保留重要的表格和文字資訊
+    【核心修正】處理單一表格列，以原子化操作抓取資料與詳細HTML。
+    此函數確保了資料提取和按鈕點擊都在同一 `row` 元素內完成，杜絕了資料錯位的可能。
     """
-    soup = BeautifulSoup(html_content, 'html.parser')
-    
-    unwanted_tags = ['script', 'style', 'nav', 'header', 'footer', 'aside', 'iframe', 'embed', 'object', 'applet']
-    for tag_name in unwanted_tags:
-        for tag in soup.find_all(tag_name):
-            tag.decompose()
-    
-    ad_patterns = ['gpt-ad', 'google-ad', 'adsense', 'adsbygoogle']
-    for pattern in ad_patterns:
-        for tag in soup.find_all(attrs={'class': re.compile(pattern, re.I)}):
-            tag.decompose()
-        for tag in soup.find_all(attrs={'id': re.compile(pattern, re.I)}):
-            tag.decompose()
-    
-    for element in soup.find_all(text=True):
-        if isinstance(element, str) and len(element) > 200:
-            code_indicators = ['const ', 'var ', 'function(', 'googletag', 'window.', 'document.']
-            if any(indicator in element for indicator in code_indicators):
-                element.replace_with('')
-    
-    for tag in soup.find_all(True):
-        attrs_to_remove = [attr for attr in tag.attrs if attr.lower().startswith('on')]
-        for attr in attrs_to_remove:
-            del tag[attr]
-        if 'style' in tag.attrs and len(tag['style']) > 100:
-            del tag['style']
-    
-    for form_tag in soup.find_all('form'):
-        form_tag.decompose()
-    
-    for input_tag in soup.find_all('input'):
-        if input_tag.get('type') not in ['hidden']:
-            input_tag.decompose()
-    
-    for table in soup.find_all('table'):
-        for tag in table.find_all(True):
-            keep_attrs = ['class', 'id', 'colspan', 'rowspan', 'bgcolor', 'align', 'valign']
-            attrs_to_remove = [attr for attr in tag.attrs if attr not in keep_attrs]
-            for attr in attrs_to_remove:
-                del tag[attr]
-    
-    for tag in soup.find_all():
-        if (not tag.get_text(strip=True) and not tag.find('img') and not tag.find('table') and
-            not tag.find('select') and tag.name not in ['br', 'hr', 'tr', 'td', 'th']):
-            tag.decompose()
-    
-    cleaned_html = re.sub(r'\n\s*\n\s*\n', '\n\n', str(soup))
-    return cleaned_html
-
-# --------------------
-# 請求模型
-# --------------------
-class FetchRequest(BaseModel):
-    url: AnyHttpUrl
-    method: Literal["GET", "POST"] = "GET"
-    headers: Optional[Dict[str, str]] = None
-    params: Optional[Dict[str, Any]] = None
-    data: Optional[Any] = None
-    referer: Optional[str] = None
-    user_agent: Optional[str] = None
-    timeout: float = 20.0
-    insecure: bool = False
-    filename: Optional[str] = None
-    pretty_content: bool = False
-
-class RenderRequest(BaseModel):
-    url: AnyHttpUrl
-    referer: Optional[str] = "https://goodinfo.tw/tw/index.asp"
-    user_agent: Optional[str] = (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-    wait_until: Literal["load", "domcontentloaded", "networkidle"] = "domcontentloaded"
-    wait_selector: Optional[str] = Field(None, description="等待指定 selector 再抓取，例如 'table'")
-    timeout_ms: int = 60000
-    disable_js: bool = False
-    filename: Optional[str] = None
-    viewport: Optional[Dict[str, int]] = None
-    cookies: Optional[Dict[str, str]] = None
-    pretty_content: bool = False
-
-class FlexibleMopsRequest(BaseModel):
-    url: str
-    batch_size: int = 10
-    max_concurrent: int = 5
-    timeout_ms: int = 300000
-
-# --------------------
-# /fetch 端點：純 HTTP 抓取
-# --------------------
-@app.post("/fetch")
-def fetch(req: FetchRequest):
-    sess = build_session(req.user_agent)
-    if req.referer:
-        sess.headers["Referer"] = req.referer
-    if req.headers:
-        hop_by_hop = {"host", "content-length", "transfer-encoding", "connection"}
-        for k, v in req.headers.items():
-            if k.lower() not in hop_by_hop:
-                sess.headers[k] = v
-    try:
-        resp = sess.request(
-            req.method, str(req.url), params=req.params, data=req.data,
-            timeout=req.timeout, verify=not req.insecure, allow_redirects=True,
-        )
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Upstream request failed: {e}")
-
-    content_bytes = resp.content
-    origin_ct = resp.headers.get("Content-Type", "application/octet-stream")
-    
-    if req.pretty_content and "html" in origin_ct.lower():
-        try:
-            html_content = content_bytes.decode(resp.encoding or 'utf-8')
-            content_bytes = clean_html_content(html_content).encode('utf-8')
-            origin_ct = "text/html; charset=utf-8"
-        except Exception:
-            pass
-    
-    base_name = req.filename or default_filename(str(req.url))
-    if ("html" in origin_ct.lower()) and "." not in base_name.split("_")[-1]:
-        base_name = f"{base_name}.html"
-    
-    if req.pretty_content and "html" in origin_ct.lower():
-        base_name = base_name.replace('.html', '_cleaned.html')
-
-    ascii_name = base_name.encode("ascii", "ignore").decode("ascii") or "download.html"
-    cd = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(base_name)}'
-
-    return StreamingResponse(
-        BytesIO(content_bytes),
-        media_type=origin_ct,
-        headers={
-            "Content-Disposition": cd, "X-Origin-Status": str(resp.status_code),
-            "X-Origin-URL": str(resp.url),
-            **({"X-Origin-Encoding": resp.encoding} if resp.encoding else {}),
-            **({"X-Content-Cleaned": "true"} if req.pretty_content else {}),
-        },
-    )
-
-# --------------------
-# /render 端點：JS 渲染抓取
-# --------------------
-@app.post("/render")
-async def render(req: RenderRequest):
-    async def _once():
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            context = await browser.new_context(
-                user_agent=req.user_agent, java_script_enabled=not req.disable_js,
-                viewport=req.viewport or {"width": 1366, "height": 900},
-                extra_http_headers={"referer": req.referer or "", "accept-language": "zh-TW,zh;q=0.9,en;q=0.8"},
-            )
-            if req.cookies:
-                await context.add_cookies([{"name": k, "value": v, "url": str(req.url)} for k, v in req.cookies.items()])
-
-            page = await context.new_page()
-            if req.referer:
-                try:
-                    await page.goto(req.referer, wait_until="domcontentloaded", timeout=min(15000, req.timeout_ms))
-                except Exception:
-                    pass
-
-            await page.goto(str(req.url), wait_until=req.wait_until, timeout=req.timeout_ms)
-            if req.wait_selector:
-                await page.wait_for_selector(req.wait_selector, timeout=req.timeout_ms, state="visible")
-
-            html = await page.content()
-            await context.close()
-            await browser.close()
-            return html
-
-    try:
-        html = await _once()
-    except PWTimeout:
-        logger.info("Timeout, retrying with 'load' wait_until state...")
-        req.wait_until = "load"
-        req.timeout_ms = int(req.timeout_ms * 1.5)
-        html = await _once()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Render failed: {e}")
-
-    if req.pretty_content:
-        try:
-            html = clean_html_content(html)
-        except Exception:
-            pass
-
-    base_name = req.filename or default_filename(str(req.url))
-    if not base_name.endswith(".html"):
-        base_name += ".html"
-    
-    if req.pretty_content:
-        base_name = base_name.replace('.html', '_cleaned.html')
-        
-    ascii_name = base_name.encode("ascii", "ignore").decode("ascii") or "page.html"
-    cd = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(base_name)}'
-
-    return StreamingResponse(
-        BytesIO(html.encode("utf-8")),
-        media_type="text/html; charset=utf-8",
-        headers={"Content-Disposition": cd, **({"X-Content-Cleaned": "true"} if req.pretty_content else {})},
-    )
-
-# --------------------
-# MOPS 安全資料解析函數
-# --------------------
-async def get_main_data_safely(page):
-    """安全地獲取主表格資料，確保返回的資料是可序列化的純基本類型"""
-    try:
-        main_data = await page.evaluate("""
-            () => {
-                const dataRows = document.querySelectorAll('table tbody tr');
-                const results = [];
-                dataRows.forEach(row => {
-                    try {
-                        const cells = Array.from(row.cells);
-                        const viewButton = row.querySelector('button');
-                        const hasViewButton = viewButton && viewButton.textContent.includes('查看');
-                        if (cells.length >= 6 && hasViewButton) {
-                            results.push({
-                                index: results.length,
-                                date: String((cells[0]?.textContent || '').trim()),
-                                time: String((cells[1]?.textContent || '').trim()),
-                                code: String((cells[2]?.textContent || '').trim()),
-                                company: String((cells[3]?.textContent || '').trim()) || `Company_${results.length}`,
-                                subject: String((cells[4]?.textContent || '').trim()),
-                                hasDetail: Boolean(hasViewButton)
-                            });
-                        }
-                    } catch (e) { console.error('Error parsing a row:', e); }
-                });
-                return results;
-            }
-        """)
-    except Exception as e:
-        logger.error(f"主資料解析失敗: {e}")
-        main_data = []
-    
-    logger.info(f"安全解析完成 - 找到 {len(main_data)} 筆有效記錄")
-    if main_data:
-        logger.info(f"前3筆資料預覽: {main_data[:3]}")
-    return main_data
-
-# --------------------
-# MOPS 專用端點
-# --------------------
-async def _fetch_mops_details_concurrently(req: FlexibleMopsRequest, page, context, limit: Optional[int] = None):
-    """使用 Locator API 併發抓取 MOPS 詳細資料的核心函式，並包含重試機制"""
-    main_data = await get_main_data_safely(page)
-    locator = page.locator('table tbody tr button:has-text("查看")')
-    button_count = await locator.count()
-
-    if limit is not None:
-        button_count = min(button_count, limit)
-
-    logger.info(f"找到 {await locator.count()} 個按鈕，準備處理其中 {button_count} 個...")
-
-    semaphore = asyncio.Semaphore(req.max_concurrent)
-
-    async def _process_single_button(index):
-        async with semaphore:
-            record = main_data[index] if index < len(main_data) else {'company': f'Unknown_{index}', 'date': 'N/A'}
-            company_name = record.get('company', 'N/A')
-            data_date = record.get('date', 'N/A')
-            
-            max_retries = 10  # 根據您的要求增加重試次數
-
-            for attempt in range(max_retries):
-                if attempt == 0:
-                    logger.info(f"  處理 {index + 1}/{button_count}: {company_name} ({data_date})")
-                else:
-                    logger.warning(f"  重試 {attempt}/{max_retries-1} - {company_name} ({data_date})")
-
-                detail_start = datetime.now()
-                try:
-                    # 結合點擊和等待新頁面的操作
-                    async with context.expect_page(timeout=15000) as page_info:
-                        await locator.nth(index).click(timeout=10000)
-                    detail_page = await page_info.value
-                    
-                    # 處理新分頁的內部邏輯
-                    try:
-                        await detail_page.wait_for_load_state("networkidle", timeout=20000)
-                        detail_content = await detail_page.content()
-                        structured = await detail_page.evaluate("() => ({ title: document.title, url: window.location.href, text_length: document.body.innerText.length })")
-                        await detail_page.close()
-                        
-                        fetch_time = (datetime.now() - detail_start).total_seconds()
-                        retry_suffix = f" (重試 {attempt} 次)" if attempt > 0 else ""
-                        logger.info(f"    -> 成功, {fetch_time:.1f}s, {len(detail_content)//1024}KB{retry_suffix}")
-                        
-                        # 成功後立即返回結果
-                        return {**record, "detail": {"html": detail_content, "structured": structured, "fetched": True, "fetch_time_seconds": fetch_time, "retry_count": attempt}}
-                    
-                    except Exception as page_e:
-                        logger.warning(f"    -> 頁面處理失敗: {str(page_e)[:100]}")
-                        try:
-                            await detail_page.close()
-                        except:
-                            pass # 頁面可能已經關閉
-                        
-                        # 如果不是最後一次嘗試，則等待後繼續重試
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(2)
-                            continue 
-                        else: # 最後一次嘗試失敗，則拋出異常
-                            raise page_e
-
-                except Exception as e:
-                    fetch_time = (datetime.now() - detail_start).total_seconds()
-                    
-                    # 判斷是否為 Alert (沒有新分頁)，這種情況不重試
-                    if "expect_page" in str(e).lower():
-                        logger.info(f"    -> Alert 或無新分頁, {fetch_time:.1f}s (不重試)")
-                        return {**record, "detail": {"fetched": True, "page_type": "alert_or_none", "retry_count": attempt}}
-                    
-                    # 對於其他錯誤 (例如點擊超時)，則進行重試
-                    if attempt < max_retries - 1:
-                        logger.warning(f"    -> 點擊或等待失敗: {str(e)[:100]}")
-                        await asyncio.sleep(2)
-                        continue
-                    else:
-                        # 所有重試均告失敗
-                        logger.error(f"    -> 最終失敗於第 {attempt+1} 次嘗試: {str(e)}")
-                        return {**record, "detail": {"fetched": False, "error": str(e), "retry_count": attempt}}
-
-    tasks = [_process_single_button(i) for i in range(button_count)]
-    return await asyncio.gather(*tasks)
-
-
-@app.post("/mops-flexible")
-async def fetch_mops_flexible(req: FlexibleMopsRequest):
-    """靈活配置的 MOPS 抓取 (使用 Locator API 和增強的重試機制)"""
-    logger.info(f"靈活抓取設定 - 批次大小: {req.batch_size}, 最大併發: {req.max_concurrent}")
-    start_time = datetime.now()
-    
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-        page = await context.new_page()
-        try:
-            await page.goto(req.url, wait_until="networkidle", timeout=60000)
-            await page.wait_for_selector("table", timeout=30000)
-            results = await _fetch_mops_details_concurrently(req, page, context)
-        except Exception as e:
-            logger.error(f"Flexible fetch 發生致命錯誤: {e}", exc_info=True)
-            raise HTTPException(status_code=502, detail=f"Flexible fetch failed: {e}")
-        finally:
-            await browser.close()
-
-    total_time = (datetime.now() - start_time).total_seconds()
-    success_count = sum(1 for r in results if r.get('detail', {}).get('fetched'))
-    logger.info(f"抓取完成 - 成功: {success_count}/{len(results)}, 總耗時: {total_time:.1f}s")
-
-    return {
-        "success": True, "total_records": len(results), "successful_details": success_count,
-        "failed_details": len(results) - success_count, "total_time_seconds": total_time,
-        "data": results, "timestamp": datetime.now().isoformat(),
+    base_info = {
+        "index": index,
+        "date": "N/A", "time": "N/A", "code": "N/A", 
+        "company": f"Unknown_{index}", "subject": "N/A", "hasDetail": False
     }
 
-@app.post("/mops-quick-test")
-async def fetch_mops_quick_test(req: RenderRequest):
-    """快速測試版本：使用新方法抓取前3筆詳細資料"""
-    logger.info(f"開始 MOPS 快速測試: {req.url}")
-    mops_req = FlexibleMopsRequest(url=str(req.url), max_concurrent=3)
+    try:
+        # 1. 在 `row_locator` 的範圍內，提取表格中的基本資料
+        base_info["date"] = await row_locator.locator('td').nth(0).inner_text()
+        base_info["time"] = await row_locator.locator('td').nth(1).inner_text()
+        base_info["code"] = await row_locator.locator('td').nth(2).inner_text()
+        base_info["company"] = await row_locator.locator('td').nth(3).inner_text()
+        base_info["subject"] = (await row_locator.locator('td').nth(4).inner_text()).replace('\r\n', ' ').strip()
+        base_info["hasDetail"] = True
+
+        logger.info(f"處理中 (Index {index}): {base_info['code']} {base_info['company']}")
+
+        # 2. 在 `row_locator` 的範圍內，找到並點擊「查看」按鈕
+        view_button = row_locator.locator('input[type="button"]:has-text("查看")')
+        page = row_locator.page
+        context = page.context
+        
+        # 3. 執行點擊並等待新視窗
+        max_retries = 3
+        for attempt in range(max_retries):
+            detail_start_time = datetime.now()
+            try:
+                async with context.expect_page(timeout=20000) as page_info:
+                    await view_button.click(timeout=15000)
+                
+                detail_page = await page_info.value
+                
+                # 在新分頁中等待並抓取內容
+                await detail_page.wait_for_load_state("domcontentloaded", timeout=20000)
+                detail_html = await detail_page.content()
+                await detail_page.close()
+                
+                fetch_time = (datetime.now() - detail_start_time).total_seconds()
+                logger.info(f"  -> Index {index} 成功, 耗時: {fetch_time:.2f}s")
+
+                base_info["detail"] = Detail(
+                    html=detail_html,
+                    fetched=True,
+                    fetch_time_seconds=fetch_time,
+                    retry_count=attempt
+                )
+                return CompanyInfo(**base_info)
+
+            except PlaywrightTimeoutError as e:
+                logger.warning(f"  -> Index {index} 第 {attempt + 1}/{max_retries} 次嘗試超時: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise  # 最後一次重試失敗，拋出異常
+                await asyncio.sleep(2) # 等待後重試
+            except Exception as e:
+                logger.error(f"  -> Index {index} 發生非預期錯誤: {e}")
+                base_info["detail"] = Detail(
+                    html="", fetched=False, fetch_time_seconds=0, 
+                    retry_count=attempt, error=f"Unexpected error: {str(e)}"
+                )
+                return CompanyInfo(**base_info)
+
+    except Exception as e:
+        error_message = f"處理 Index {index} 最終失敗: {str(e)}"
+        logger.error(error_message)
+        base_info["detail"] = Detail(
+            html="", fetched=False, fetch_time_seconds=0, 
+            retry_count=max_retries if 'max_retries' in locals() else 0, 
+            error=error_message
+        )
+    
+    return CompanyInfo(**base_info)
+
+
+# --- FastAPI 端點 (Endpoint) ---
+
+@app.get("/", summary="API 根目錄")
+async def root():
+    """提供 API 的基本資訊"""
+    return {
+        "message": "歡迎使用修正版的 MOPS 公開資訊觀測站爬蟲 API",
+        "usage": "請使用 POST 方法訪問 /scrape-mops 來開始抓取資料"
+    }
+
+class MopsRequest(BaseModel):
+    max_concurrent: int = Field(5, description="最大同時處理的併發任務數量", ge=1, le=20)
+    limit: Optional[int] = Field(None, description="限制處理的資料筆數，用於測試", ge=1)
+
+@app.post("/scrape-mops", response_model=ScrapeResponse, summary="抓取 MOPS 當日重大訊息")
+async def scrape_mops_data(req: MopsRequest):
+    """
+    啟動 Playwright 瀏覽器，前往公開資訊觀測站，
+    並以安全的方式逐一抓取每家公司的重大訊息詳細內容。
+    """
+    start_time = datetime.now()
+    logger.info(f"接收到爬取請求 (併發數: {req.max_concurrent}, 限制: {req.limit or '無'})...")
+    
+    url = "https://mops.twse.com.tw/mops/web/t05sr01_1"
     
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        context = await browser.new_context()
-        page = await context.new_page()
         try:
-            await page.goto(mops_req.url, wait_until="networkidle", timeout=60000)
-            await page.wait_for_selector("table", timeout=30000)
-            # 調用核心函式並限制只處理3筆
-            results = await _fetch_mops_details_concurrently(mops_req, page, context, limit=3)
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+            
+            logger.info(f"正在導航至: {url}")
+            await page.goto(url, timeout=60000, wait_until='domcontentloaded')
+            
+            logger.info("頁面載入完成，等待表格元素出現...")
+            await page.wait_for_selector('table.hasBorder', timeout=30000)
+            
+            # 【核心修正】定位所有包含「查看」按鈕的資料列
+            rows_with_button = page.locator('table.hasBorder > tbody > tr:has(input[type="button"]:has-text("查看"))')
+            row_count = await rows_with_button.count()
+            
+            # 應用 limit 限制
+            process_count = min(row_count, req.limit) if req.limit is not None else row_count
+            logger.info(f"找到 {row_count} 筆可處理的資料，將處理其中 {process_count} 筆...")
+
+            # 建立非同步任務列表
+            semaphore = asyncio.Semaphore(req.max_concurrent)
+            
+            async def semaphore_task_wrapper(row_locator, index):
+                async with semaphore:
+                    return await process_single_row(row_locator, index)
+            
+            tasks = [
+                semaphore_task_wrapper(rows_with_button.nth(i), i) 
+                for i in range(process_count)
+            ]
+            
+            # 平行執行所有任務
+            results = await asyncio.gather(*tasks)
+            
+        except PlaywrightTimeoutError as e:
+            logger.error(f"導航或尋找表格時發生超時錯誤: {e}")
+            raise HTTPException(status_code=504, detail="頁面載入或元素定位超時")
         except Exception as e:
-             logger.error(f"Quick test 發生錯誤: {e}", exc_info=True)
-             results = [] # 發生錯誤時返回空結果
+            logger.error(f"爬取過程中發生嚴重錯誤: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
         finally:
-            await browser.close()
-    
-    success_rate = sum(1 for r in results if r.get('detail', {}).get('fetched')) / len(results) * 100 if results else 0
-    return {"test_results": results, "success_rate": success_rate}
+            if 'browser' in locals() and browser.is_connected():
+                await browser.close()
+                logger.info("瀏覽器已關閉。")
 
-# --------------------
-# 健康檢查
-# --------------------
-@app.get("/healthz")
+    total_time = (datetime.now() - start_time).total_seconds()
+    successful_count = sum(1 for r in results if r.detail and r.detail.fetched)
+    failed_count = len(results) - successful_count
+
+    logger.info(f"所有資料處理完成！成功: {successful_count}, 失敗: {failed_count}, 總耗時: {total_time:.2f}s")
+
+    return ScrapeResponse(
+        success=True,
+        total_records=len(results),
+        successful_details=successful_count,
+        failed_details=failed_count,
+        total_time_seconds=total_time,
+        data=results,
+        timestamp=datetime.now()
+    )
+
+# --- 健康檢查 ---
+@app.get("/healthz", summary="健康檢查")
 def healthz():
-    return {"ok": True, "version": "1.7.0"}
+    return {"status": "ok", "version": "2.0.0-fixed"}
 
-# --------------------
-# 主程式入口
-# --------------------
+# --- 程式進入點 ---
 if __name__ == "__main__":
-    import uvicorn
-    import os
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # 使用 uvicorn 啟動 FastAPI 應用程式
+    # 在終端機中運行 `python mops_crawler_fixed.py` 即可啟動
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
