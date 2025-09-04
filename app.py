@@ -405,13 +405,15 @@ async def scrape_mops_data(req: MopsRequest):
             
             async def process_with_semaphore(row_locator, index):
                 async with semaphore:
+                    only_show_list = getattr(req, 'only_show_list', False)
                     if page_version == "new":
-                        return await process_new_version_row(row_locator, index, req.clean_html, req.max_retries, req.only_show_list)
+                        return await process_new_version_row(row_locator, index, req.clean_html, req.max_retries, only_show_list)
                     else:
-                        return await process_old_version_row(row_locator, index, req.clean_html, req.max_retries, req.only_show_list)
+                        return await process_old_version_row(row_locator, index, req.clean_html, req.max_retries, only_show_list)
             
             # 在建立任務前記錄設定
-            logger.info(f"使用設定: max_retries={req.max_retries}, max_concurrent={req.max_concurrent}, batch_delay={req.batch_delay}s, only_show_list={req.only_show_list}")
+            only_show_list = getattr(req, 'only_show_list', False)
+            logger.info(f"使用設定: max_retries={req.max_retries}, max_concurrent={req.max_concurrent}, batch_delay={req.batch_delay}s, only_show_list={only_show_list}")
             
             # 批次處理邏輯
             results = []
