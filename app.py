@@ -105,8 +105,8 @@ async def detect_page_version(page) -> str:
     return "old"  # 預設為舊版
 
 # --- 處理舊版頁面的單一列 ---
-async def process_old_version_row(row_locator: Locator, index: int, clean_html: bool, max_retries: int = 10) -> CompanyInfo:
-    """處理舊版 MOPS 頁面的單一表格列（含重試機制）"""
+async def process_old_version_row(row_locator: Locator, index: int, clean_html: bool) -> CompanyInfo:
+    """處理舊版 MOPS 頁面的單一表格列"""
     base_info = {
         "index": index,
         "date": "N/A", "time": "N/A", "code": "N/A", 
@@ -123,25 +123,17 @@ async def process_old_version_row(row_locator: Locator, index: int, clean_html: 
         base_info["subject"] = (await cells.nth(4).inner_text()).replace('\r\n', ' ').strip()
         base_info["hasDetail"] = True
 
-        # 準備標題預覽（限制長度）
-        subject_preview = base_info['subject'][:50] + "..." if len(base_info['subject']) > 50 else base_info['subject']
-        logger.info(f"處理中 (Index {index}): {base_info['date']} {base_info['time']} {base_info['code']} {base_info['company']} - {subject_preview}")
+        logger.info(f"處理中 (Index {index}): {base_info['code']} {base_info['company']}")
 
         # 找到並點擊「查看」按鈕
         view_button = row_locator.locator('input[type="button"][value*="查看"], button:has-text("查看")')
         page = row_locator.page
         context = page.context
         
-        # 記錄實際使用的重試次數
-        logger.debug(f"  Index {index} 使用 max_retries={max_retries}")
-        
+        max_retries = 3
         for attempt in range(max_retries):
             detail_start_time = datetime.now()
             try:
-                if attempt > 0:
-                    logger.info(f"  -> Index {index} 重試 {attempt}/{max_retries-1}")
-                    await asyncio.sleep(2)  # 重試前等待
-                
                 # 嘗試捕獲新視窗
                 async with context.expect_page(timeout=15000) as page_info:
                     await view_button.click(timeout=10000)
@@ -156,8 +148,7 @@ async def process_old_version_row(row_locator: Locator, index: int, clean_html: 
                 if clean_html:
                     detail_html = clean_html_content(detail_html)
                 
-                logger.info(f"  -> Index {index} [{base_info['code']} {base_info['company']}] 成功 (新視窗), 耗時: {fetch_time:.2f}s" +
-                           (f" (重試 {attempt} 次)" if attempt > 0 else ""))
+                logger.info(f"  -> Index {index} 成功 (新視窗), 耗時: {fetch_time:.2f}s")
                 
                 base_info["detail"] = Detail(
                     html=detail_html,
@@ -166,15 +157,18 @@ async def process_old_version_row(row_locator: Locator, index: int, clean_html: 
                     retry_count=attempt,
                     page_type="new_window"
                 )
-                return CompanyInfo(**base_info)  # 成功後立即返回
+                return CompanyInfo(**base_info)
 
             except PlaywrightTimeoutError:
                 # 可能是 alert 而非新視窗
                 try:
-                    await page.wait_for_timeout(1000)
+                    # 檢查是否有 alert
+                    await page.wait_for_timeout(1000)  # 短暫等待
+                    
+                    # 嘗試接受 alert
                     page.on("dialog", lambda dialog: dialog.accept())
                     
-                    logger.info(f"  -> Index {index} 是 alert 類型")
+                    logger.info(f"  -> Index {index} 可能是 alert 類型")
                     base_info["detail"] = Detail(
                         html="",
                         fetched=True,
@@ -186,36 +180,19 @@ async def process_old_version_row(row_locator: Locator, index: int, clean_html: 
                     
                 except Exception:
                     if attempt == max_retries - 1:
-                        logger.error(f"  -> Index {index} 最終失敗（超時）")
-                        base_info["detail"] = Detail(
-                            html="", fetched=False,
-                            fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(),
-                            retry_count=attempt, error="Timeout after retries"
-                        )
+                        raise
+                    await asyncio.sleep(2)
                     
             except Exception as e:
-                error_msg = str(e)
-                
-                # 特殊處理：瀏覽器或頁面已關閉
-                if "closed" in error_msg.lower():
-                    logger.error(f"  -> Index {index} 瀏覽器已關閉: {error_msg[:100]}")
-                    base_info["detail"] = Detail(
-                        html="", fetched=False,
-                        fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(),
-                        retry_count=attempt, error="Browser closed"
-                    )
-                    return CompanyInfo(**base_info)  # 不再重試
-                
-                logger.error(f"  -> Index {index} 發生錯誤: {error_msg[:100]}")
-                if attempt == max_retries - 1:
-                    base_info["detail"] = Detail(
-                        html="", fetched=False,
-                        fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(),
-                        retry_count=attempt, error=error_msg
-                    )
+                logger.error(f"  -> Index {index} 發生錯誤: {e}")
+                base_info["detail"] = Detail(
+                    html="", fetched=False, fetch_time_seconds=0, 
+                    retry_count=attempt, error=str(e)
+                )
+                return CompanyInfo(**base_info)
 
     except Exception as e:
-        logger.error(f"處理 Index {index} 基本資料失敗: {e}")
+        logger.error(f"處理 Index {index} 失敗: {e}")
         base_info["detail"] = Detail(
             html="", fetched=False, fetch_time_seconds=0, 
             retry_count=0, error=str(e)
@@ -224,8 +201,8 @@ async def process_old_version_row(row_locator: Locator, index: int, clean_html: 
     return CompanyInfo(**base_info)
 
 # --- 處理新版頁面的單一列 ---
-async def process_new_version_row(row_locator: Locator, index: int, clean_html: bool, max_retries: int = 10) -> CompanyInfo:
-    """處理新版 MOPS 頁面的單一表格列（含重試機制）"""
+async def process_new_version_row(row_locator: Locator, index: int, clean_html: bool) -> CompanyInfo:
+    """處理新版 MOPS 頁面的單一表格列"""
     base_info = {
         "index": index,
         "date": "N/A", "time": "N/A", "code": "N/A", 
@@ -238,30 +215,14 @@ async def process_new_version_row(row_locator: Locator, index: int, clean_html: 
         cell_count = await cells.count()
         
         if cell_count >= 5:
-            # 嘗試提取每個欄位的文字內容
-            date_text = (await cells.nth(0).inner_text()).strip()
-            time_text = (await cells.nth(1).inner_text()).strip()
-            code_text = (await cells.nth(2).inner_text()).strip()
-            company_text = (await cells.nth(3).inner_text()).strip()
-            subject_text = (await cells.nth(4).inner_text()).replace('\r\n', ' ').replace('\n', ' ').strip()
-            
-            base_info["date"] = date_text if date_text else "N/A"
-            base_info["time"] = time_text if time_text else "N/A"
-            base_info["code"] = code_text if code_text else "N/A"
-            base_info["company"] = company_text if company_text else f"Unknown_{index}"
-            base_info["subject"] = subject_text if subject_text else "N/A"
+            base_info["date"] = await cells.nth(0).inner_text()
+            base_info["time"] = await cells.nth(1).inner_text()
+            base_info["code"] = await cells.nth(2).inner_text()
+            base_info["company"] = await cells.nth(3).inner_text()
+            base_info["subject"] = (await cells.nth(4).inner_text()).replace('\r\n', ' ').strip()
             base_info["hasDetail"] = True
-        else:
-            # 如果欄位數量不足，嘗試顯示偵錯資訊
-            logger.warning(f"Index {index} 只找到 {cell_count} 個欄位，預期至少 5 個")
-            # 顯示實際找到的內容
-            for i in range(cell_count):
-                cell_text = await cells.nth(i).inner_text()
-                logger.debug(f"  欄位 {i}: {cell_text[:30]}...")
 
-        # 準備標題預覽（限制長度）
-        subject_preview = base_info['subject'][:50] + "..." if len(base_info['subject']) > 50 else base_info['subject']
-        logger.info(f"處理中 (Index {index}): {base_info['date']} {base_info['time']} {base_info['code']} {base_info['company']} - {subject_preview}")
+        logger.info(f"處理中 (Index {index}): {base_info['code']} {base_info['company']}")
 
         # 新版可能使用 button 而非 input
         view_button = row_locator.locator('button:has-text("查看"), input[value*="查看"], a:has-text("查看")')
@@ -270,90 +231,41 @@ async def process_new_version_row(row_locator: Locator, index: int, clean_html: 
             page = row_locator.page
             context = page.context
             
-            # 記錄實際使用的重試次數
-            logger.debug(f"  Index {index} 使用 max_retries={max_retries}")
-            
-            for attempt in range(max_retries):
-                detail_start_time = datetime.now()
-                try:
-                    if attempt > 0:
-                        logger.info(f"  -> Index {index} 重試 {attempt}/{max_retries-1}")
-                        await asyncio.sleep(2)  # 重試前等待
-                    
-                    # 新版可能使用 SPA 導航或新視窗
-                    async with context.expect_page(timeout=15000) as page_info:
-                        await view_button.click(timeout=10000)
-                    
-                    detail_page = await page_info.value
-                    await detail_page.wait_for_load_state("networkidle", timeout=30000)
-                    detail_html = await detail_page.content()
-                    await detail_page.close()
-                    
-                    fetch_time = (datetime.now() - detail_start_time).total_seconds()
-                    
-                    if clean_html:
-                        detail_html = clean_html_content(detail_html)
-                    
-                    logger.info(f"  -> Index {index} 成功, 耗時: {fetch_time:.2f}s" + 
-                               (f" (重試 {attempt} 次)" if attempt > 0 else ""))
-                    
-                    base_info["detail"] = Detail(
-                        html=detail_html,
-                        fetched=True,
-                        fetch_time_seconds=fetch_time,
-                        retry_count=attempt,
-                        page_type="new_window"
-                    )
-                    return CompanyInfo(**base_info)  # 成功後立即返回
-                    
-                except PlaywrightTimeoutError as e:
-                    logger.warning(f"  -> Index {index} [{base_info['code']} {base_info['company']}] 超時: {str(e)[:100]}")
-                    if attempt == max_retries - 1:
-                        # 最後一次嘗試失敗
-                        base_info["detail"] = Detail(
-                            html="", fetched=False, 
-                            fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(), 
-                            retry_count=attempt, error=f"Timeout after {max_retries} attempts"
-                        )
-                        
-                except Exception as e:
-                    error_msg = str(e)
-                    
-                    # 特殊處理：瀏覽器或頁面已關閉的錯誤
-                    if "closed" in error_msg.lower():
-                        logger.error(f"  -> Index {index} [{base_info['code']} {base_info['company']}] 瀏覽器已關閉: {error_msg[:100]}")
-                        # 如果還有重試機會，繼續重試
-                        if attempt < max_retries - 1:
-                            logger.info(f"  -> Index {index} 將在 2 秒後重試...")
-                            await asyncio.sleep(2)
-                            continue
-                        else:
-                            # 最後一次重試也失敗了
-                            base_info["detail"] = Detail(
-                                html="", fetched=False, 
-                                fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(),
-                                retry_count=attempt, error="Browser closed after all retries"
-                            )
-                            return CompanyInfo(**base_info)
-                    
-                    logger.warning(f"  -> Index {index} [{base_info['code']} {base_info['company']}] 失敗: {error_msg[:100]}")
-                    if attempt == max_retries - 1:
-                        # 最後一次嘗試失敗
-                        base_info["detail"] = Detail(
-                            html="", fetched=False,
-                            fetch_time_seconds=(datetime.now() - detail_start_time).total_seconds(),
-                            retry_count=attempt, error=error_msg
-                        )
-        else:
-            # 沒有找到查看按鈕
-            logger.info(f"  -> Index {index} 沒有詳細資料按鈕")
-            base_info["detail"] = Detail(
-                html="", fetched=False, fetch_time_seconds=0,
-                retry_count=0, error="No view button found"
-            )
+            detail_start_time = datetime.now()
+            try:
+                # 新版可能使用 SPA 導航或新視窗
+                async with context.expect_page(timeout=15000) as page_info:
+                    await view_button.click(timeout=10000)
+                
+                detail_page = await page_info.value
+                await detail_page.wait_for_load_state("networkidle", timeout=30000)
+                detail_html = await detail_page.content()
+                await detail_page.close()
+                
+                fetch_time = (datetime.now() - detail_start_time).total_seconds()
+                
+                if clean_html:
+                    detail_html = clean_html_content(detail_html)
+                
+                logger.info(f"  -> Index {index} 成功, 耗時: {fetch_time:.2f}s")
+                
+                base_info["detail"] = Detail(
+                    html=detail_html,
+                    fetched=True,
+                    fetch_time_seconds=fetch_time,
+                    retry_count=0,
+                    page_type="new_window"
+                )
+                
+            except Exception as e:
+                logger.warning(f"  -> Index {index} 詳細資料取得失敗: {e}")
+                base_info["detail"] = Detail(
+                    html="", fetched=False, fetch_time_seconds=0, 
+                    retry_count=0, error=str(e)
+                )
 
     except Exception as e:
-        logger.error(f"處理 Index {index} 基本資料失敗: {e}")
+        logger.error(f"處理 Index {index} 失敗: {e}")
         base_info["detail"] = Detail(
             html="", fetched=False, fetch_time_seconds=0, 
             retry_count=0, error=str(e)
@@ -371,8 +283,7 @@ class MopsRequest(BaseModel):
     limit: Optional[int] = Field(None, description="限制處理筆數", ge=1)
     clean_html: bool = Field(False, description="是否清理 HTML")
     wait_time: int = Field(5, description="新版頁面額外等待時間（秒）", ge=0, le=30)
-    max_retries: int = Field(10, description="失敗重試次數", ge=1, le=20)  # 預設改為 10
-    batch_delay: float = Field(0, description="每批次完成後等待時間（秒）", ge=0, le=30)
+    max_retries: int = Field(3, description="失敗重試次數", ge=1, le=10)
 
 @app.post("/scrape-mops", response_model=ScrapeResponse)
 async def scrape_mops_data(req: MopsRequest):
@@ -451,10 +362,37 @@ async def scrape_mops_data(req: MopsRequest):
             
             # 計算要處理的資料筆數
             row_count = await rows_locator.count()
-            process_count = min(row_count, req.limit) if req.limit else row_count
-            logger.info(f"找到 {row_count} 筆資料，將處理 {process_count} 筆")
             
-            if process_count == 0:
+            # 處理 only_scrap_indices 參數
+            if req.only_scrap_indices is not None:
+                if isinstance(req.only_scrap_indices, list):
+                    # 數字列表：只處理指定的索引
+                    valid_indices = [i for i in req.only_scrap_indices if 0 <= i < row_count]
+                    logger.info(f"只處理指定索引: {valid_indices}")
+                    process_indices = valid_indices
+                elif isinstance(req.only_scrap_indices, str) and req.only_scrap_indices.upper() == "ALL":
+                    # "ALL" 字串：處理全部
+                    logger.info("處理全部資料 (only_scrap_indices='ALL')")
+                    process_count = min(row_count, req.limit) if req.limit else row_count
+                    process_indices = list(range(process_count))
+                elif req.only_scrap_indices is False or req.only_scrap_indices == "false":
+                    # False 或 "false"：處理全部
+                    logger.info("處理全部資料 (only_scrap_indices=False)")
+                    process_count = min(row_count, req.limit) if req.limit else row_count
+                    process_indices = list(range(process_count))
+                else:
+                    # 其他值：當作處理全部
+                    logger.warning(f"不支援的 only_scrap_indices 值: {req.only_scrap_indices}，將處理全部資料")
+                    process_count = min(row_count, req.limit) if req.limit else row_count
+                    process_indices = list(range(process_count))
+            else:
+                # None/null：處理全部資料或限制數量
+                process_count = min(row_count, req.limit) if req.limit else row_count
+                process_indices = list(range(process_count))
+            
+            logger.info(f"找到 {row_count} 筆資料，將處理 {len(process_indices)} 筆")
+            
+            if len(process_indices) == 0:
                 await browser.close()
                 return ScrapeResponse(
                     success=True, total_records=0, successful_details=0, 
@@ -468,40 +406,40 @@ async def scrape_mops_data(req: MopsRequest):
             async def process_with_semaphore(row_locator, index):
                 async with semaphore:
                     if page_version == "new":
-                        return await process_new_version_row(row_locator, index, req.clean_html, req.max_retries)
+                        return await process_new_version_row(row_locator, index, req.clean_html, req.max_retries, req.only_show_list)
                     else:
-                        return await process_old_version_row(row_locator, index, req.clean_html, req.max_retries)
+                        return await process_old_version_row(row_locator, index, req.clean_html, req.max_retries, req.only_show_list)
             
             # 在建立任務前記錄設定
-            logger.info(f"使用設定: max_retries={req.max_retries}, max_concurrent={req.max_concurrent}, batch_delay={req.batch_delay}s")
+            logger.info(f"使用設定: max_retries={req.max_retries}, max_concurrent={req.max_concurrent}, batch_delay={req.batch_delay}s, only_show_list={req.only_show_list}")
             
             # 批次處理邏輯
             results = []
             if req.batch_delay > 0:
-                # 分批處理，每批 max_concurrent 筆
-                for batch_start in range(0, process_count, req.max_concurrent):
-                    batch_end = min(batch_start + req.max_concurrent, process_count)
-                    batch_size = batch_end - batch_start
+                # 分批處理
+                for batch_num, batch_start_idx in enumerate(range(0, len(process_indices), req.max_concurrent)):
+                    batch_indices = process_indices[batch_start_idx:batch_start_idx + req.max_concurrent]
+                    batch_size = len(batch_indices)
                     
-                    logger.info(f"開始處理批次: {batch_start//req.max_concurrent + 1}, 資料 {batch_start}-{batch_end-1} (共 {batch_size} 筆)")
+                    logger.info(f"開始處理批次 {batch_num + 1}, 索引: {batch_indices} (共 {batch_size} 筆)")
                     
                     batch_tasks = [
-                        process_with_semaphore(rows_locator.nth(i), i) 
-                        for i in range(batch_start, batch_end)
+                        process_with_semaphore(rows_locator.nth(idx), idx) 
+                        for idx in batch_indices
                     ]
                     
                     batch_results = await asyncio.gather(*batch_tasks)
                     results.extend(batch_results)
                     
                     # 如果不是最後一批，則等待
-                    if batch_end < process_count:
+                    if batch_start_idx + req.max_concurrent < len(process_indices):
                         logger.info(f"批次完成，等待 {req.batch_delay} 秒後繼續...")
                         await asyncio.sleep(req.batch_delay)
             else:
                 # 原本的邏輯：全部同時處理（受 semaphore 限制）
                 tasks = [
-                    process_with_semaphore(rows_locator.nth(i), i) 
-                    for i in range(process_count)
+                    process_with_semaphore(rows_locator.nth(idx), idx) 
+                    for idx in process_indices
                 ]
                 results = await asyncio.gather(*tasks)
             
